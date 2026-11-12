@@ -3197,6 +3197,7 @@ def _modulo_diario():
         especialidad: str = ""           # cuando el archivo la indica (programación, adicionales)
         uso_recurso: list[dict] = field(default_factory=list)   # filas para «7.0 Uso de recurso»
         materiales: list[dict] = field(default_factory=list)    # materiales / consumibles declarados (formulario UDR)
+        precom: bool = False             # reporte de terreno de precomisionamiento (formulario «Trabajos de pre-com»)
     
         @property
         def total_hh(self) -> float:
@@ -3210,7 +3211,7 @@ def _modulo_diario():
                 "trabajadores": [t.__dict__ for t in self.trabajadores],
                 "actividades": [a.__dict__ for a in self.actividades],
                 "tipo": self.tipo, "especialidad": self.especialidad, "uso_recurso": self.uso_recurso,
-                "materiales": self.materiales,
+                "materiales": self.materiales, "precom": self.precom,
             }
     
         @staticmethod
@@ -3219,7 +3220,8 @@ def _modulo_diario():
                                d.get("turno_texto", ""), d.get("turno", "Día"), d.get("area_reporte", ""),
                                observaciones=d.get("observaciones", ""), avisos=d.get("avisos", []),
                                tipo=d.get("tipo", "terreno"), especialidad=d.get("especialidad", ""),
-                               uso_recurso=d.get("uso_recurso", []), materiales=d.get("materiales", []))
+                               uso_recurso=d.get("uso_recurso", []), materiales=d.get("materiales", []),
+                               precom=d.get("precom", False))
             r.trabajadores = [Trabajador(**t) for t in d.get("trabajadores", [])]
             r.actividades = [Actividad(**a) for a in d.get("actividades", [])]
             return r
@@ -3538,6 +3540,14 @@ def _modulo_diario():
                 equipos_txt.append(f"{nombre_eq} X{len(hs)}")
                 hm_total += sum(hs)
             esp = _especialidad_udr([p_.cargo for p_ in personas], esp_p, rep.especialidad)
+            if es_precom:
+                # también es un reporte de terreno: cada persona trabajó en las actividades del formulario (BD Personal / Master)
+                rep.precom = True
+                rep.supervisor = next((p_.nombre for p_ in personas if "SUPERV" in norm(p_.cargo)), "")
+                rep.actividades = [Actividad("PRECOM", "Precom", detalle, "", " ".join(etiquetas.values()))]
+                for p_ in personas:
+                    if p_.total:
+                        p_.horas = {"PRECOM": p_.total}
             rep.uso_recurso.append({**base, "equipos": " / ".join(equipos_txt), "hm": hm_total or None,
                                     "directos": len(personas), "hh_directos": sum(p.total for p in personas),
                                     "especialidad": esp, "ruts": [(p.rut, p.total, p.cargo) for p in personas]})
@@ -3603,7 +3613,14 @@ def _modulo_diario():
     LECTORES = {"terreno": _leer_terreno, "uso_recurso": _leer_uso_recurso, "adicionales": _leer_adicionales,
                 "programacion": _leer_programacion}
     NOMBRE_TIPO = {"terreno": "Reporte de terreno", "uso_recurso": "Uso de recurso (UDR)", "adicionales": "Adicionales / desviaciones",
-                   "programacion": "Programación de actividades"}
+                   "programacion": "Programación de actividades", "precom": "Reporte de terreno Precom (+ UDR)"}
+    
+    
+    def nombre_tipo(r) -> str:
+        """Rótulo del formato de un reporte (objeto o dict guardado)."""
+        precom = r.get("precom") if isinstance(r, dict) else getattr(r, "precom", False)
+        tipo = r.get("tipo", "terreno") if isinstance(r, dict) else r.tipo
+        return NOMBRE_TIPO["precom"] if precom else NOMBRE_TIPO.get(tipo, tipo)
     
     
     def leer_reportes(datos: bytes, archivo: str) -> tuple[list[ReporteTerreno], list[str]]:
@@ -5228,7 +5245,8 @@ def _modulo_diario():
         esp_reporte = {id(r): esp_de(r) for r in reportes}
         # Cobertura por especialidad Y turno: sin reporte de noche, el personal de noche mantiene su estado.
         cubiertas = {(norm(plantel[r].especialidad), presentes[r][0].turno) for r in presentes
-                     if r in plantel and norm(plantel[r].moimod) == "DIRECTO" and presentes[r][0].tipo == "terreno"}
+                     if r in plantel and norm(plantel[r].moimod) == "DIRECTO"
+                     and (presentes[r][0].tipo == "terreno" or getattr(presentes[r][0], "precom", False))}
     
         def turno_de(p: Persona) -> str:
             return "Noche" if norm(p.tipo_turno) == "NOCHE" or p.faena.upper() == "TN" else "Día"
@@ -6119,7 +6137,8 @@ def _modulo_diario():
                 aid = aid.strip() if isinstance(aid, str) else ""
                 if not aid:                                    # convención del informe: agrupadores del P6 por tipo
                     cr_ = norm(c_ if isinstance(c_, str) else "")
-                    aid = ("Adicionales UDR" if cr_.startswith("EXTRAORDINARIA") and "Adicionales UDR" in pl.p6 else
+                    aid = ("Uso de Recursos" if cod == "PRECOM" and "Uso de Recursos" in pl.p6 else
+                           "Adicionales UDR" if cr_.startswith("EXTRAORDINARIA") and "Adicionales UDR" in pl.p6 else
                            "OTROS" if cr_.startswith("HABILITACION") and "OTROS" in pl.p6 else "")
                 area = a.get("area") if isinstance(a.get("area"), str) else ""
                 partes.append({**base, "id": aid, "criterio": crit(c_ if isinstance(c_, str) else ""),
@@ -9701,7 +9720,7 @@ def _modulo_vdiario():
                                                   contrato_id=c.contrato_id())
                     tipos = {}
                     for r in leidos:
-                        tipos[D.NOMBRE_TIPO[r.tipo]] = tipos.get(D.NOMBRE_TIPO[r.tipo], 0) + 1
+                        tipos[D.nombre_tipo(r)] = tipos.get(D.nombre_tipo(r), 0) + 1
                     resumen.append(f"**{a.name}**: " + ", ".join(f"{v} {k.lower()}" for k, v in tipos.items()) +
                                    (" · " + " · ".join(notas) if notas else ""))
                 except Exception as e:
@@ -9732,7 +9751,7 @@ def _modulo_vdiario():
             tipo = d.get("tipo", "terreno")
             especialidad = d.get("especialidad") if tipo != "terreno" and d.get("especialidad") else \
                 (max(set(esp), key=esp.count) if esp else "–")
-            filas.append({"id": r["id"], "archivo": r["archivo"], "tipo": D.NOMBRE_TIPO.get(tipo, tipo), "especialidad": especialidad,
+            filas.append({"id": r["id"], "archivo": r["archivo"], "tipo": D.nombre_tipo(d), "especialidad": especialidad,
                           "turno": d.get("turno", "Día"), "supervisor": d.get("supervisor", ""), "fecha_reporte": d.get("fecha"),
                           "personas": len(trab), "hh": sum(t.get("total", 0) for t in trab),
                           "fuera_plantel": sum(1 for t in trab if t["rut"] not in plantel),
