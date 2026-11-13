@@ -456,6 +456,36 @@ def _modulo_db():
             creado_por TEXT,
             creado_en TEXT NOT NULL
         )""",
+        f"""CREATE TABLE IF NOT EXISTS semanal_archivos (
+            id {_PK},
+            tipo TEXT NOT NULL,
+            nombre TEXT NOT NULL,
+            fecha TEXT NOT NULL,
+            numero INTEGER,
+            contenido TEXT NOT NULL,
+            creado_por TEXT,
+            creado_en TEXT NOT NULL
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS cubicacion_planos (
+            id {_PK},
+            plano TEXT NOT NULL,
+            rev TEXT,
+            disciplina TEXT NOT NULL,
+            descripcion TEXT,
+            datos TEXT NOT NULL,
+            hh REAL,
+            creado_por TEXT,
+            creado_en TEXT NOT NULL
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS cubicacion_cargas (
+            id {_PK},
+            fecha TEXT NOT NULL,
+            archivo TEXT NOT NULL,
+            disciplinas TEXT,
+            datos TEXT NOT NULL,
+            creado_por TEXT,
+            creado_en TEXT NOT NULL
+        )""",
         f"""CREATE TABLE IF NOT EXISTS diario_reportes (
             id {_PK},
             fecha TEXT NOT NULL,
@@ -636,7 +666,8 @@ def _modulo_db():
     
     
     TABLAS_POR_CONTRATO = ("proyectos", "informes", "restricciones", "diario_archivos", "diario_reportes", "diario_informes",
-                           "tm_cargas", "desv_cargas")
+                           "tm_cargas", "desv_cargas", "semanal_archivos",
+                           "cubicacion_cargas", "cubicacion_planos")
     
     MIGRACIONES = [  # columnas agregadas después de la primera versión
         ("informe_items", "hh_gastadas", _REAL),
@@ -794,7 +825,10 @@ def _modulo_db():
         """Cuántos registros tiene un contrato en cada módulo (para confirmar antes de borrarlo)."""
         nombres = {"proyectos": "proyectos P6", "informes": "informes semanales", "restricciones": "restricciones 6WLA",
                    "diario_informes": "informes diarios emitidos", "diario_reportes": "reportes de terreno",
-                   "tm_cargas": "cargas T&M", "desv_cargas": "cargas del LOG de desviaciones"}
+                   "tm_cargas": "cargas T&M", "desv_cargas": "cargas del LOG de desviaciones",
+                   "semanal_archivos": "informes semanales generados",
+                   "cubicacion_cargas": "planillas de avance cargadas (cubicación)",
+                   "cubicacion_planos": "cubicaciones hechas desde planos"}
         return {n: uno(f"SELECT COUNT(*) FROM {t} WHERE contrato_id = ?", (int(cid),))[0] for t, n in nombres.items()}
     
     
@@ -1074,6 +1108,99 @@ def _modulo_db():
                 ejecutar("DELETE FROM diario_archivos WHERE id = ?", (vid,), conn)
                 ejecutar("UPDATE diario_informes SET archivo_id = NULL WHERE archivo_id = ?", (vid,), conn)
         return aid
+    
+    
+    def guardar_base_semanal(nombre: str, fecha: str, numero: int, datos: bytes, usuario: str, tipo: str = "base", *,
+                             contrato_id: int) -> int:
+        """Guarda el informe semanal que sirve de base para la semana siguiente (se conservan las últimas versiones)."""
+        with transaccion() as conn:
+            aid = insertar(
+                "INSERT INTO semanal_archivos (tipo, nombre, fecha, numero, contenido, creado_por, creado_en, contrato_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (tipo, nombre, fecha, numero, _b64(datos), usuario, ahora(), int(contrato_id)), conn,
+            )
+            viejos = ejecutar("SELECT id FROM semanal_archivos WHERE contrato_id = ? ORDER BY id DESC", (int(contrato_id),),
+                              conn).fetchall()[ARCHIVOS_A_CONSERVAR:]
+            for (vid,) in viejos:
+                ejecutar("DELETE FROM semanal_archivos WHERE id = ?", (vid,), conn)
+        return aid
+    
+    
+    def base_semanal_vigente(contrato_id: int) -> dict | None:
+        fila = uno("SELECT id, tipo, nombre, fecha, numero, creado_por, creado_en FROM semanal_archivos WHERE contrato_id = ? "
+                   "ORDER BY id DESC LIMIT 1", (int(contrato_id),))
+        if not fila:
+            return None
+        return dict(zip(["id", "tipo", "nombre", "fecha", "numero", "creado_por", "creado_en"], fila))
+    
+    
+    def archivo_semanal(aid: int) -> bytes | None:
+        fila = uno("SELECT contenido FROM semanal_archivos WHERE id = ?", (int(aid),))
+        return _de_b64(fila[0]) if fila else None
+    
+    
+    def archivos_semanal(contrato_id: int) -> pd.DataFrame:
+        return consultar("SELECT id, tipo, nombre, fecha, numero, creado_por, creado_en FROM semanal_archivos WHERE contrato_id = ? "
+                         "ORDER BY id DESC", (int(contrato_id),))
+    
+    
+    # ---------------------------------------------------------------- Cubicación (planillas de avance por disciplina)
+    
+    def guardar_carga_cubicacion(fecha: str, archivo: str, disciplinas: str, datos: dict, usuario: str, *,
+                                 contrato_id: int) -> int:
+        """Guarda lo leído de una planilla de avance (JSON, no el archivo). Reemplaza la carga del mismo archivo y fecha."""
+        import json
+        with transaccion() as conn:
+            ejecutar("DELETE FROM cubicacion_cargas WHERE contrato_id = ? AND fecha = ? AND archivo = ?",
+                     (int(contrato_id), fecha, archivo), conn)
+            return insertar(
+                "INSERT INTO cubicacion_cargas (fecha, archivo, disciplinas, datos, creado_por, creado_en, contrato_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (fecha, archivo, disciplinas, json.dumps(datos, ensure_ascii=False), usuario, ahora(), int(contrato_id)), conn)
+    
+    
+    def guardar_cub_plano(plano: str, rev: str, disciplina: str, descripcion: str, datos: dict, hh: float,
+                          usuario: str, *, contrato_id: int) -> int:
+        """Guarda la cubicación de un plano. Reemplaza la del mismo plano y revisión."""
+        import json
+        with transaccion() as conn:
+            ejecutar("DELETE FROM cubicacion_planos WHERE contrato_id = ? AND plano = ? AND COALESCE(rev, '') = ?",
+                     (int(contrato_id), plano, rev or ""), conn)
+            return insertar(
+                "INSERT INTO cubicacion_planos (plano, rev, disciplina, descripcion, datos, hh, creado_por, creado_en, "
+                "contrato_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (plano, rev or "", disciplina, descripcion, json.dumps(datos, ensure_ascii=False, default=str), float(hh),
+                 usuario, ahora(), int(contrato_id)), conn)
+    
+    
+    def cub_planos(contrato_id: int) -> pd.DataFrame:
+        return consultar("SELECT id, plano, rev, disciplina, descripcion, hh, creado_por, creado_en FROM cubicacion_planos "
+                         "WHERE contrato_id = ? ORDER BY plano, rev", (int(contrato_id),))
+    
+    
+    def cub_plano(cid_cub: int) -> dict | None:
+        import json
+        fila = uno("SELECT datos FROM cubicacion_planos WHERE id = ?", (int(cid_cub),))
+        return json.loads(fila[0]) if fila else None
+    
+    
+    def borrar_cub_plano(cid_cub: int, *, contrato_id: int):
+        ejecutar("DELETE FROM cubicacion_planos WHERE id = ? AND contrato_id = ?", (int(cid_cub), int(contrato_id)))
+    
+    
+    def cargas_cubicacion(contrato_id: int) -> pd.DataFrame:
+        return consultar("SELECT id, fecha, archivo, disciplinas, creado_por, creado_en FROM cubicacion_cargas "
+                         "WHERE contrato_id = ? ORDER BY fecha DESC, id", (int(contrato_id),))
+    
+    
+    def carga_cubicacion(cid_carga: int) -> dict | None:
+        import json
+        fila = uno("SELECT datos FROM cubicacion_cargas WHERE id = ?", (int(cid_carga),))
+        return json.loads(fila[0]) if fila else None
+    
+    
+    def borrar_carga_cubicacion(cid_carga: int, *, contrato_id: int):
+        ejecutar("DELETE FROM cubicacion_cargas WHERE id = ? AND contrato_id = ?", (int(cid_carga), int(contrato_id)))
     
     
     def base_diario_vigente(contrato_id: int) -> dict | None:
@@ -2977,11 +3104,13 @@ def _modulo_xlsx_xml():
         return f'<c r="{ref}"{s} t="inlineStr"><is><t xml:space="preserve">{_xml_texto(valor)}</t></is></c>'
     
     
-    def fijar_celdas(xml: str, valores: dict[str, object]) -> str:
+    def fijar_celdas(xml: str, valores: dict[str, object], estilos: dict[str, str] | None = None) -> str:
         """Escribe valores en celdas existentes o nuevas conservando el estilo de cada celda.
     
         valores: {"AD6": date(...), "B16": "texto", "AB34": 123, "X1": ("=SUM(A1:A2)",) -> fórmula}
+        estilos: estilo (atributo s) para las celdas que no existen todavía, p. ej. copiado de la fila de arriba.
         """
+        estilos = estilos or {}
         por_fila: dict[int, dict[str, object]] = {}
         for ref, v in valores.items():
             col, fila = separar_ref(ref)
@@ -2994,18 +3123,18 @@ def _modulo_xlsx_xml():
                 continue
             existentes.add(num)
             partes.append(xml[ultimo:ini])
-            partes.append(_reemplazar_en_fila(fila_xml, num, por_fila[num]))
+            partes.append(_reemplazar_en_fila(fila_xml, num, por_fila[num], estilos))
             ultimo = fin
         partes.append(xml[ultimo:])
         xml = "".join(partes)
         faltantes = sorted(set(por_fila) - existentes)
         for num in faltantes:
-            nueva = _reemplazar_en_fila(f'<row r="{num}"></row>', num, por_fila[num])
+            nueva = _reemplazar_en_fila(f'<row r="{num}"></row>', num, por_fila[num], estilos)
             xml = _insertar_fila(xml, num, nueva)
         return xml
     
     
-    def _reemplazar_en_fila(fila_xml: str, num: int, nuevos: dict[str, object]) -> str:
+    def _reemplazar_en_fila(fila_xml: str, num: int, nuevos: dict[str, object], estilos: dict | None = None) -> str:
         cab = re.match(r"<row\b[^>]*?(/?)>", fila_xml)
         apertura = cab.group(0)
         if apertura.endswith("/>"):
@@ -3015,8 +3144,8 @@ def _modulo_xlsx_xml():
         for col, (a, interior, completo) in actuales.items():
             todas[col] = completo
         for col, v in nuevos.items():
-            estilo = actuales.get(col, ({}, None, ""))[0].get("s")
             ref = f"{col}{num}"
+            estilo = actuales[col][0].get("s") if col in actuales else (estilos or {}).get(ref)
             if isinstance(v, tuple) and v and isinstance(v[0], str) and v[0].startswith("="):
                 todas[col] = xml_celda(ref, v[1] if len(v) > 1 else None, estilo, formula=v[0][1:])
             else:
@@ -3077,6 +3206,165 @@ def _modulo_xlsx_xml():
                 cel = re.sub(r"<f\b[^>]*/>|<f\b[^>]*>.*?</f>", "", cel, flags=re.S)
             return cel
         return _RE_CELL.sub(f, fila_xml)
+    
+    
+    # ------------------------------------------------------------------ insertar filas (como «Insertar fila» de Excel)
+    
+    _RE_REF_FX = re.compile(
+        r"(?<![A-Za-z0-9_.\$])"
+        r"((?:'(?:[^']|'')+'|[A-Za-z_][A-Za-z0-9_.]*)!)?"         # hoja (opcional)
+        r"(\$?[A-Z]{1,3}\$?\d+|\$?\d+(?=:\$?\d+))"                 # celda, o fila de un rango de filas completas
+        r"(?::(\$?[A-Z]{1,3}\$?\d+|\$?\d+))?"                      # fin del rango
+        r"(?![A-Za-z0-9_(!])")
+    
+    
+    def _mover_ref(ref: str, en: int, n: int) -> str:
+        m = re.fullmatch(r"(\$?[A-Z]{0,3}\$?)(\d+)", ref)
+        if not m:
+            return ref
+        fila = int(m.group(2))
+        return f"{m.group(1)}{fila + n if fila >= en else fila}"
+    
+    
+    def mover_refs_formula(formula: str, hoja: str, en: int, n: int, propia: bool) -> str:
+        """Corre n filas las referencias a filas >= en de la hoja «hoja» (las sin hoja cuentan si propia=True).
+        Un rango que cruza la fila de inserción se agranda, igual que en Excel."""
+        def f(m):
+            h, a, b = m.groups()
+            nombre = None
+            if h:
+                nombre = h[:-1]
+                if nombre.startswith("'"):
+                    nombre = nombre[1:-1].replace("''", "'")
+            if (nombre is None and not propia) or (nombre is not None and _desescapar(nombre) != hoja):
+                return m.group(0)
+            return (h or "") + _mover_ref(a, en, n) + (":" + _mover_ref(b, en, n) if b else "")
+        partes = formula.split('"')
+        for i in range(0, len(partes), 2):                       # fuera de los textos entre comillas
+            partes[i] = _RE_REF_FX.sub(f, partes[i])
+        return '"'.join(partes)
+    
+    
+    def _mover_sqref(sqref: str, en: int, n: int) -> str:
+        return " ".join(":".join(_mover_ref(p, en, n) for p in r.split(":")) for r in sqref.split())
+    
+    
+    _RE_REF_REL = re.compile(r"(?<![A-Za-z0-9_.!'\$])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![\d(A-Za-z_!])")
+    
+    
+    def desplazar_relativas(formula: str, dfila: int) -> str:
+        """Desplaza las filas relativas (sin $) de todas las referencias de la fórmula."""
+        def f(m):
+            c_abs, col, f_abs, fila = m.groups()
+            return f"{c_abs}{col}{f_abs}{int(fila) + (0 if f_abs else dfila)}"
+        partes = formula.split('"')
+        for i in range(0, len(partes), 2):
+            partes[i] = _RE_REF_REL.sub(f, partes[i])
+        return '"'.join(partes)
+    
+    
+    def insertar_filas(L: "Libro", hoja: str, en: int, n: int, modelo: int | None = None) -> bool:
+        """Inserta n filas en la hoja a partir de la fila «en» (la que estaba en «en» baja n filas), con el formato,
+        las celdas combinadas y las fórmulas de la fila «modelo» (por defecto, la propia «en»). Corre celdas, fórmulas
+        (de todo el libro), combinadas, formatos condicionales, validaciones, saltos de página, imágenes y nombres
+        definidos (área de impresión). Devuelve False si no se pudo hacer sin romper fórmulas compartidas."""
+        if n <= 0:
+            return True
+        modelo = modelo or en
+        xml = L.hoja_xml(hoja)
+        # fórmulas compartidas que cruzan la fila de inserción: no se pueden correr por partes
+        for m in re.finditer(r'<f\b[^>]*t="shared"[^>]*ref="([^"]+)"', xml):
+            r = m.group(1).split(":")
+            if len(r) == 2 and separar_ref(r[0])[1] < en <= separar_ref(r[1])[1]:
+                return False
+    
+        def fx(m):
+            attrs, texto = m.group(1), m.group(2)
+            attrs = re.sub(r'\bref="([^"]+)"', lambda mm: f'ref="{_mover_sqref(mm.group(1), en, n)}"', attrs)
+            if texto is None:
+                return f"<f{attrs}/>"
+            return f"<f{attrs}>{mover_refs_formula(_desescapar(texto), hoja, en, n, True).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')}</f>"
+        re_f = re.compile(r"<f\b([^>]*?)(?:/>|>(.*?)</f>)", re.S)
+    
+        ini, fin = xml.find("<sheetData"), xml.find("</sheetData>")
+        datos = xml[ini:fin]
+        fila_modelo = next((completo for num, _, completo, _, _ in filas(xml) if num == modelo), None)
+    
+        def fila_nueva(m):
+            completo = m.group(0)
+            num = int(_attrs(m.group(1)).get("r", 0))
+            if num >= en:
+                completo = renumerar_fila(completo, num + n)
+            return re_f.sub(fx, completo)
+        datos = _RE_ROW.sub(fila_nueva, datos)
+        # filas copiadas de la fila modelo
+        copias = []
+        if fila_modelo:
+            base = quitar_formulas_relativas(fila_modelo)
+            base = re.sub(r'(<f\b[^>]*?)\s(?:t="shared"|ref="[^"]*"|si="\d+")', r"\1", base)
+            for k in range(n):
+                nueva = renumerar_fila(base, en + k)
+                nueva = re.sub(r"<f\b([^>]*)>(.*?)</f>",
+                               lambda mm: f"<f{mm.group(1)}>" + desplazar_relativas(_desescapar(mm.group(2)), en + k - modelo)
+                               .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</f>", nueva, flags=re.S)
+                copias.append(nueva)
+        if copias:
+            pos = next((m.start() for m in _RE_ROW.finditer(datos) if int(_attrs(m.group(1)).get("r", 0)) >= en + n), None)
+            pos = len(datos) if pos is None else pos
+            datos = datos[:pos] + "".join(copias) + datos[pos:]
+        xml = xml[:ini] + datos + xml[fin:]
+        resto_ini = xml.find("</sheetData>")
+        cabeza, resto = xml[:resto_ini], xml[resto_ini:]
+        # celdas combinadas
+        combinadas_modelo = [r for r in re.findall(r'<mergeCell ref="([^"]+)"', resto)
+                             if all(separar_ref(p)[1] == modelo for p in r.split(":"))]
+        resto = re.sub(r'(<mergeCell ref=")([^"]+)(")', lambda mm: mm.group(1) + _mover_sqref(mm.group(2), en, n) + mm.group(3), resto)
+        if combinadas_modelo:
+            extra = []
+            for k in range(n):
+                for r in combinadas_modelo:
+                    a, b = r.split(":")
+                    extra.append(f'<mergeCell ref="{separar_ref(a)[0]}{en + k}:{separar_ref(b)[0]}{en + k}"/>')
+            resto = re.sub(r'<mergeCells count="(\d+)"', lambda mm: f'<mergeCells count="{int(mm.group(1)) + len(extra)}"', resto, count=1)
+            resto = resto.replace("</mergeCells>", "".join(extra) + "</mergeCells>", 1)
+        # formatos condicionales, validaciones y fórmulas que contienen
+        resto = re.sub(r'(\bsqref=")([^"]+)(")', lambda mm: mm.group(1) + _mover_sqref(mm.group(2), en, n) + mm.group(3), resto)
+        resto = re.sub(r"(<xm:sqref>)([^<]+)(</xm:sqref>)", lambda mm: mm.group(1) + _mover_sqref(mm.group(2), en, n) + mm.group(3), resto)
+        resto = re.sub(r"(<(formula|formula1|formula2|xm:f)>)(.*?)(</\2>)",
+                       lambda mm: mm.group(1) + mover_refs_formula(mm.group(3), hoja, en, n, True) + mm.group(4), resto, flags=re.S)
+        # saltos de página (id = fila tras la que se corta)
+        resto = re.sub(r'(<brk id=")(\d+)(")', lambda mm: f"{mm.group(1)}{int(mm.group(2)) + n if int(mm.group(2)) >= en else mm.group(2)}{mm.group(3)}", resto)
+        resto = re.sub(r'(<hyperlink\b[^>]*\bref=")([^"]+)(")', lambda mm: mm.group(1) + _mover_sqref(mm.group(2), en, n) + mm.group(3), resto)
+        xml = actualizar_dimension(cabeza + resto)
+        L.guardar_hoja(hoja, xml)
+        # imágenes y formas (anclas 0-based)
+        rels = L.hojas[hoja].replace("worksheets/", "worksheets/_rels/") + ".rels"
+        if L.existe(rels):
+            for t in re.findall(r'Target="\.\./drawings/(drawing\d+\.xml)"', L.leer(rels)):
+                ruta = f"xl/drawings/{t}"
+                d = L.leer(ruta)
+                d = re.sub(r"(<xdr:row>)(\d+)(</xdr:row>)",
+                           lambda mm: f"{mm.group(1)}{int(mm.group(2)) + n if int(mm.group(2)) + 1 >= en else mm.group(2)}{mm.group(3)}", d)
+                L.escribir(ruta, d)
+        # nombres definidos (área de impresión, filtros…) y fórmulas de otras hojas que apuntan a esta
+        wb = L.leer("xl/workbook.xml")
+        wb = re.sub(r"(<definedName\b[^>]*>)(.*?)(</definedName>)",
+                    lambda mm: mm.group(1) + mover_refs_formula(_desescapar(mm.group(2)), hoja, en, n, False)
+                    .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + mm.group(3), wb, flags=re.S)
+        L.escribir("xl/workbook.xml", wb)
+        clave = escape(hoja)
+        for otra, ruta in L.hojas.items():
+            if otra == hoja:
+                continue
+            x2 = L.leer(ruta)
+            if clave not in x2:
+                continue
+            x2n = re_f.sub(lambda mm: mm.group(0) if mm.group(2) is None else
+                           f"<f{mm.group(1)}>" + mover_refs_formula(_desescapar(mm.group(2)), hoja, en, n, False)
+                           .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</f>", x2)
+            if x2n != x2:
+                L.escribir(ruta, x2n)
+        return True
 
     return SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
 
@@ -3101,6 +3389,7 @@ def _modulo_diario():
     ESTADOS = {
         "T": "Trabajando turno día", "TN": "Trabajando turno noche", "TT": "Trabajando (TT)", "TC": "Trabajando en curso (TC)",
         "D": "Descanso", "L": "Licencia", "PSG": "Permiso sin goce", "PCG": "Permiso con goce", "F": "Falla",
+        "AC": "En acreditación", "V": "Vacaciones",
     }
     
     
@@ -3322,6 +3611,21 @@ def _modulo_diario():
         return ""
     
     
+    _ABC = "ABCDEFGHIJKLMNÑOPQRSTUVWXYZ"
+    
+    
+    def _letra(v) -> str:
+        """Código de actividad del reporte (A, B, … N, Ñ, O …). A diferencia de norm(), la Ñ NO se convierte en N:
+        en los reportes «N» y «Ñ» son actividades distintas."""
+        s = str(v if v is not None else "").strip().upper().replace(" ", "")
+        s = unicodedata.normalize("NFC", s)
+        return s if re.fullmatch(r"[A-ZÑ]{1,2}", s) else norm(s).replace(" ", "")
+    
+    
+    def _orden_letra(s: str):
+        return (len(s), [_ABC.index(ch) if ch in _ABC else 99 for ch in s])
+    
+    
     def _turno_de(textos: list[str]) -> str:
         return "Noche" if any("NOCHE" in norm(t) for t in textos) else "Día"
     
@@ -3341,7 +3645,9 @@ def _modulo_diario():
         fila_cab, cab = _cabecera(grid, [{"RUT"}, {"NOMBRE"}, {"CARGO"}])
         c_rut, c_nom, c_car = cab.index("RUT"), cab.index("NOMBRE"), cab.index("CARGO")
         c_tot = next((j for j, v in enumerate(cab) if v.startswith("TOTAL") and j > c_car), None)
-        letras = {j: v for j, v in enumerate(cab) if re.fullmatch(r"[A-Z]{1,2}", v) and j > c_car and (c_tot is None or j < c_tot)}
+        crudo = [_letra(v) for v in grid[fila_cab]] + [""] * len(cab)
+        letras = {j: crudo[j] for j, v in enumerate(cab) if re.fullmatch(r"[A-ZÑ]{1,2}", crudo[j]) and j > c_car
+                  and (c_tot is None or j < c_tot)}
         i = fila_cab + 1
         while i < len(grid):
             f = grid[i] + [None] * 70
@@ -3374,7 +3680,7 @@ def _modulo_diario():
             if (n and n[0] == "ACT") or (any(x.startswith("AREA") for x in n) and any("DESCRIPCION" in x for x in n)):
                 fila_act = k
                 break
-        orden_letras = sorted(set(letras.values()), key=lambda s: (len(s), s))
+        orden_letras = sorted(set(letras.values()), key=_orden_letra)
         if fila_act is not None:
             cab_a = [norm(v) for v in grid[fila_act]]
             c_area = next((j for j, v in enumerate(cab_a) if v.startswith("AREA")), 1)
@@ -3386,9 +3692,9 @@ def _modulo_diario():
                 if norm(f[0]).startswith("OBSERVACION") or norm(f[0]) == "IMAGEN":
                     break
                 desc = _txt(f[c_desc])
-                cod = norm(f[0]).replace(" ", "")
+                cod = _letra(f[0])
                 if desc:
-                    if not re.fullmatch(r"[A-Z]{1,2}", cod):
+                    if not re.fullmatch(r"[A-ZÑ]{1,2}", cod):
                         corr = orden_letras[pos] if pos < len(orden_letras) else cod
                         rep.avisos.append(f"Actividad n°{pos + 1} con código '{_txt(f[0])}': se asumió '{corr}' por su posición.")
                         cod = corr
@@ -3613,7 +3919,155 @@ def _modulo_diario():
     LECTORES = {"terreno": _leer_terreno, "uso_recurso": _leer_uso_recurso, "adicionales": _leer_adicionales,
                 "programacion": _leer_programacion}
     NOMBRE_TIPO = {"terreno": "Reporte de terreno", "uso_recurso": "Uso de recurso (UDR)", "adicionales": "Adicionales / desviaciones",
-                   "programacion": "Programación de actividades", "precom": "Reporte de terreno Precom (+ UDR)"}
+                   "programacion": "Programación de actividades", "precom": "Reporte de terreno Precom (+ UDR)",
+                   "pm_materiales": "PM de materiales (PDF)"}
+    
+    
+    # ---------------------------------------------------------------- PM de materiales (PDF)
+    
+    _PM_DESC = re.compile(r"DESCRIP|MATERIAL|DETALLE|ARTICULO|PRODUCTO|INSUMO|ITEM DESC|NOMBRE")
+    _PM_CANT = re.compile(r"^CANT|CANTIDAD|CANT\.|^QTY|SOLICITAD|ENTREGAD|DESPACHAD")
+    _PM_UNID = re.compile(r"^U\.?M\.?$|^UN\.?$|^UND|UNIDAD|^UNID|^U/M|^MED")
+    _PM_TRAB = re.compile(r"ACTIVITY|ACTIVIDAD|\bOT\b|ORDEN DE TRABAJO|TRABAJO|NDC|UDR|DESTINO|USO|APLICACION|AREA")
+    _PM_CODIGO = re.compile(r"^(COD|CODIGO|SKU|N° PARTE|NRO PARTE|PART)")
+    _UNIDADES_PM = r"UN|UND|UNID|UNIDAD(?:ES)?|C/U|KG|KGS|GR|TON|M|MT|MTS|ML|M2|M3|LT|LTS|L|GL|GAL|ROLLO|ROLLOS|RLL|CJ|CAJA|CAJAS|PZA|PZ|JGO|JUEGO|PAR|BOLSA|BOLSAS|SACO|SACOS|TIRA|TIRAS|PAQ|PQT|PAQUETE|BARRA|BARRAS|PLANCHA|PL|TAMBOR|BIDON|TARRO|GLB|GLOBAL|HR|HRS|SET|KIT|CU"
+    
+    
+    def _num_pm(v) -> float | None:
+        s = str(v or "").strip().replace(" ", "")
+        if not s:
+            return None
+        if re.fullmatch(r"\d{1,3}(\.\d{3})+(,\d+)?", s):          # 1.234,5
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", ".")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    
+    
+    def _cabecera_pm(texto: str) -> dict:
+        """Datos generales del PM: número, solicitante, Activity ID / OT / NDC y fecha."""
+        t = texto or ""
+        info = {}
+        m = re.search(r"\b(?:P\.?\s?M\.?|PEDIDO DE MATERIAL(?:ES)?|PARTE DE MATERIAL(?:ES)?|VALE(?: DE CONSUMO| DE MATERIALES)?|"
+                      r"SOLICITUD DE MATERIAL(?:ES)?)\s*(?:N\s*[°ºo]\.?|NRO\.?|NUM\.?|#)?\s*[:\-]?\s*([A-Z]{0,4}-?\d[\d\-]{1,14})", t, re.I)
+        if m:
+            info["pm"] = m.group(1).strip("-")
+        m = re.search(r"(?:SOLICITAD[OA] POR|SOLICITANTE|PEDIDO POR|RESPONSABLE|SUPERVISOR)\s*[:\-]?\s*([^\n]{3,60})", t, re.I)
+        if m:
+            info["solicitado"] = re.split(r"\s{3,}|\b(?:FECHA|CARGO|FIRMA|AREA|ÁREA)\b", m.group(1).strip(), flags=re.I)[0].strip(" :-")
+        m = re.search(r"\bSY-\d{4}[A-Z]{3}\d{3,5}\b", t)
+        if m:
+            info["trabajo"] = m.group(0)
+        else:
+            m = re.search(r"\b(?:NDC|UDR)\s*(?:N\s*[°ºo]\.?)?\s*[:\-]?\s*(\d{3,5})", t, re.I)
+            if m:
+                info["trabajo"] = f"NDC {m.group(1)}"
+            else:
+                m = re.search(r"(?:\bOT\b|ORDEN DE TRABAJO)\s*(?:N\s*[°ºo]\.?)?\s*[:\-]?\s*([A-Z0-9\-]{3,20})", t, re.I)
+                if m:
+                    info["trabajo"] = f"OT {m.group(1)}"
+        m = re.search(r"(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})", t)
+        if m:
+            try:
+                a = int(m.group(3)); a = a + 2000 if a < 100 else a
+                info["fecha"] = date(a, int(m.group(2)), int(m.group(1)))
+            except ValueError:
+                pass
+        return info
+    
+    
+    def _materiales_de_tabla(tabla: list[list]) -> list[dict]:
+        filas = [[re.sub(r"\s+", " ", str(c or "")).strip() for c in f] for f in tabla if f]
+        for i, f in enumerate(filas[:8]):
+            cab = [norm(c) for c in f]
+            c_d = next((j for j, c in enumerate(cab) if _PM_DESC.search(c) and not _PM_CODIGO.search(c)), None)
+            c_q = next((j for j, c in enumerate(cab) if _PM_CANT.search(c) and j != c_d), None)
+            if c_d is None or c_q is None:
+                continue
+            c_u = next((j for j, c in enumerate(cab) if _PM_UNID.search(c) and j not in (c_d, c_q)), None)
+            c_t = next((j for j, c in enumerate(cab) if _PM_TRAB.search(c) and j not in (c_d, c_q, c_u)), None)
+            c_c = next((j for j, c in enumerate(cab) if _PM_CODIGO.search(c) and j not in (c_d, c_q, c_u, c_t)), None)
+            out = []
+            for g in filas[i + 1:]:
+                g = g + [""] * (len(f) - len(g))
+                d_, q_ = g[c_d], _num_pm(g[c_q])
+                if not d_ or norm(d_).startswith(("TOTAL", "OBSERVAC", "FIRMA")):
+                    continue
+                if q_ is None:
+                    if out and not any(g[j] for j in range(len(g)) if j != c_d):     # descripción que sigue en otra línea
+                        out[-1]["descripcion"] += " " + d_
+                    continue
+                m = {"descripcion": d_, "cantidad": q_, "unidad": g[c_u] if c_u is not None else ""}
+                if c_t is not None:                     # la tabla trae su propia columna de trabajo / Activity ID
+                    m["trabajo"] = g[c_t]
+                if c_c is not None and g[c_c]:
+                    m["codigo"] = g[c_c]
+                out.append(m)
+            if out:
+                return out
+        return []
+    
+    
+    def _materiales_de_texto(texto: str) -> list[dict]:
+        """Respaldo para PDF sin tabla dibujada: líneas «[ítem] descripción cantidad unidad» o «… unidad cantidad»."""
+        out = []
+        for linea in (texto or "").splitlines():
+            l = linea.strip()
+            m = re.match(rf"^(?:\d{{1,3}}[.)]?\s+)?(?:[A-Z0-9\-]{{4,}}\s+)?(.{{4,}}?)\s+(\d+(?:[.,]\d+)?)\s+({_UNIDADES_PM})\.?$", l, re.I) \
+                or re.match(rf"^(?:\d{{1,3}}[.)]?\s+)?(?:[A-Z0-9\-]{{4,}}\s+)?(.{{4,}}?)\s+({_UNIDADES_PM})\.?\s+(\d+(?:[.,]\d+)?)$", l, re.I)
+            if not m:
+                continue
+            d_, a, b = m.groups()
+            q_, u_ = (a, b) if _num_pm(a) is not None else (b, a)
+            if re.search(r"FECHA|TOTAL|PAGINA|PÁGINA|RUT|FONO", d_, re.I):
+                continue
+            out.append({"descripcion": d_.strip(" -:"), "cantidad": _num_pm(q_), "unidad": u_.upper()})
+        return out
+    
+    
+    def leer_pm_materiales(datos: bytes, archivo: str) -> ReporteTerreno:
+        """PM (pedido / parte de materiales) en PDF → reporte con la lista de materiales para la sección 8.0."""
+        textos, mats = [], []
+        try:
+            import pdfplumber
+        except ImportError:
+            pdfplumber = None
+        if pdfplumber is not None:
+            with pdfplumber.open(io.BytesIO(datos)) as pdf:
+                for pag in pdf.pages:
+                    textos.append(pag.extract_text() or "")
+                    tablas = pag.extract_tables() or []
+                    if not tablas:
+                        tablas = pag.extract_tables({"vertical_strategy": "text", "horizontal_strategy": "text"}) or []
+                    for t in tablas:
+                        mats += _materiales_de_tabla(t)
+        else:                                   # sin pdfplumber: solo texto, con pypdf
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                raise ValueError("falta el componente para leer PDF. Cierra la app y vuelve a abrirla con "
+                                 "Iniciar_SYNCORE.bat (lo instala solo), o ejecuta: python -m pip install pdfplumber")
+            textos = [p.extract_text() or "" for p in PdfReader(io.BytesIO(datos)).pages]
+        texto = "\n".join(textos)
+        if not texto.strip():
+            raise ValueError("el PDF no tiene texto (parece escaneado o una foto); no se pueden leer los materiales.")
+        if not mats:
+            mats = _materiales_de_texto(texto)
+        if not mats:
+            raise ValueError("no se encontró la tabla de materiales (columnas descripción y cantidad).")
+        info = _cabecera_pm(texto)
+        nombre = re.sub(r"\.pdf$", "", archivo, flags=re.I)
+        ref = f"PM {info['pm']}" if info.get("pm") else nombre
+        for m in mats:
+            m.setdefault("trabajo", info.get("trabajo", ""))
+            m["solicitado"] = info.get("solicitado", "")
+            m["observacion"] = ref + (f" · cód. {m.pop('codigo')}" if m.get("codigo") else "")
+        rep = ReporteTerreno(archivo, info.get("fecha"), info.get("solicitado", ""), "", "Día", "", tipo="pm_materiales")
+        rep.materiales = mats
+        return rep
     
     
     def nombre_tipo(r) -> str:
@@ -3708,6 +4162,7 @@ def _modulo_diario():
         noche: bool | None     # None: la tarja no dice el turno
         texto: str             # lo que venía en la tarja (para mostrarlo)
         acreditado: str = ""   # columna ACREDITADO de la tarja (SI / NO / N/A), si la trae
+        ficha: dict = field(default_factory=dict)   # datos personales de la tarja en columnas de BD Personal (E..AA)
     
     
     # Códigos de asistencia más comunes → estado de BD Personal. «P» = asistió (el turno se decide después).
@@ -3717,6 +4172,7 @@ def _modulo_diario():
         "F": "F", "FA": "F", "FALLA": "F", "FALTA": "F", "AUSENTE": "F", "INASISTENCIA": "F", "0": "F", "NO": "F", "NS": "F",
         "D": "D", "DE": "D", "DESCANSO": "D", "LIBRE": "D", "BAJADA": "D", "L": "L", "LM": "L", "LICENCIA": "L",
         "V": "V", "VAC": "V", "VACACIONES": "V", "VACACION": "V", "PCG": "PCG", "PERMISO": "PCG", "PSG": "PSG",
+        "AC": "AC", "ACRED": "AC", "EN ACREDITACION": "AC",
     }
     
     
@@ -3778,6 +4234,28 @@ def _modulo_diario():
         return bool(re.fullmatch(r"(?:[A-Za-zÁÉÍÓÚáéíóú]{1,3}\.?\s*)?\d{1,2}([-/.]\d{1,2}([-/.]\d{2,4})?)?", _txt(v)))
     
     
+    # Encabezado de la tarja -> columna de BD Personal (mismo maestro de personal)
+    _TARJA_A_BD = (("ROL", "E"), ("TURNO", "F"), ("VIGENTE", "G"), ("V - F", "G"), ("TIPO DE TURNO", "H"), ("NOMBRE", "I"),
+                   ("CARGO", "J"), ("ESPECIALIDAD", "K"), ("AREA", "L"), ("FECHA DE NACIMIENTO", "M"), ("COMUNA", "N"),
+                   ("REGION", "O"), ("LOCAL", "P"), ("DIRECCION", "Q"), ("TELEFONO", "R"), ("FECHA CONTRATACION", "S"),
+                   ("FECHA DE CONTRATACION", "S"), ("FECHA FINIQUITO", "T"), ("FECHA DE FINIQUITO", "T"), ("CAUSAL", "U"),
+                   ("EMPRESA", "V"), ("MOI/MOD", "W"), ("CORREO", "X"), ("GENERO", "Y"), ("ESTATUS", "Z"), ("ACREDITADO", "AA"))
+    
+    
+    def _cols_ficha(nombres: list[str]) -> dict[int, str]:
+        out = {}
+        for j, n in enumerate(nombres):
+            if not n:
+                continue
+            for pref, col in _TARJA_A_BD:
+                if (n == pref or n.startswith(pref + " ") or n.startswith(pref + "/") or n.startswith(pref)) and col not in out.values():
+                    if pref == "TURNO" and n != "TURNO":
+                        continue                               # «TURNO» exacto (14X14 A); «TIPO DE TURNO» va aparte
+                    out[j] = col
+                    break
+        return out
+    
+    
     def _leer_tarja_grilla(grid, fecha: date, origen: str) -> tuple[dict[str, Marca], list[str]]:
         notas: list[str] = []
         cab = None
@@ -3801,6 +4279,7 @@ def _modulo_diario():
             i0, nombres = cab
             j_rut = next(j for j, n in enumerate(nombres) if n == "RUT" or n.startswith("RUT ") or n in ("R.U.T", "R.U.T.", "RUN", "RUT TRABAJADOR"))
         j_nom = next((j for j, n in enumerate(nombres) if "NOMBRE" in n or n in ("TRABAJADOR", "APELLIDOS")), None)
+        cols_ficha = _cols_ficha(nombres) if len(_cols_ficha(nombres)) >= 6 else {}
         j_acr = next((j for j, n in enumerate(nombres) if n in ("ACREDITADO", "ACREDITADA", "ACREDITACION", "ACREDITADO SI/NO")), None)
     
         # ¿Formato mensual (una columna por día)? Se busca en el encabezado y en las 2 filas de arriba.
@@ -3860,7 +4339,12 @@ def _modulo_diario():
                 est = est or "F"
             else:
                 est, noche, texto = "P", None, "en la lista"        # lista simple de asistentes
+            ficha = {col: (val(j).date().isoformat() if isinstance(val(j), datetime) else
+                           val(j).isoformat() if isinstance(val(j), date) else val(j))
+                     for j, col in cols_ficha.items() if val(j) not in (None, "")}      # (fechas en texto ISO: se guarda en JSON)
             if est is None:
+                if ficha:                                      # sin marca del día, pero con su ficha (vigente / finiquitado)
+                    marcas.setdefault(rut, Marca(rut, nombre, "", None, "", "", ficha))
                 continue
             if j_jor is not None and val(j_jor) not in (None, ""):
                 jt = norm(val(j_jor))
@@ -3872,7 +4356,7 @@ def _modulo_diario():
             if previo and previo.estado in ("P", "T", "TN", "TT", "TC") and est not in ("P", "T", "TN", "TT", "TC"):
                 continue                                       # dos marcas del mismo día: manda la de asistencia
             acr = norm(val(j_acr)) if j_acr is not None else ""
-            marcas[rut] = Marca(rut, nombre, est, noche, texto, acr if acr not in ("", "#N/A", "0") else "")
+            marcas[rut] = Marca(rut, nombre, est, noche, texto, acr if acr not in ("", "#N/A", "0") else "", ficha)
         if otras_fechas:
             notas.append(f"{origen}: {otras_fechas} fila(s) de otras fechas no se consideraron.")
         return marcas, notas
@@ -4012,6 +4496,17 @@ def _modulo_diario():
         return salida, notas
     
     
+    def _vigente(m: "Marca") -> bool:
+        f = m.ficha or {}
+        g, z = norm(f.get("G")), norm(f.get("Z"))
+        return (g.startswith("VIGENTE") or z.startswith("CONTRATADO")) and not g.startswith("FINIQUITADO")
+    
+    
+    def _finiquitado(m: "Marca") -> bool:
+        f = m.ficha or {}
+        return norm(f.get("G")).startswith("FINIQUITADO") or norm(f.get("Z")).startswith("FINIQUITADO")
+    
+    
     def leer_tarja(datos: bytes, archivo: str, fecha: date) -> tuple[dict[str, Marca], list[str]]:
         """Lee una tarja de asistencia en cualquiera de los formatos habituales:
         - lista del día: RUT (+ nombre) + estado/asistencia/marca, o + hora de entrada, o solo la lista de los que asistieron;
@@ -4094,6 +4589,7 @@ def _modulo_diario():
         estatus: str
         faena: str
         turno: str = ""                  # sistema de turno (columna TURNO de BD Personal): «14X14 A», «15X13 B», «8X6 A»…
+        ficha: dict = field(default_factory=dict)   # datos de la tarja para una persona nueva (columna de BD Personal -> valor)
     
     
     @dataclass
@@ -4212,17 +4708,31 @@ def _modulo_diario():
             nd = {**d, **{k: v for k, v in c.items() if k in _MAQ_COLS}}
             if norm(nd.get("estado")).startswith("DESMOVILIZ"):
                 continue
+            if norm(nd.get("estado")).startswith(("MANTEN", "PANNE")):
+                nd["disponible"] = "SI"                        # sigue disponible para el contrato
             out.append(nd)
         return out
     
     
+    # Estados que cuentan como equipo disponible y trabajado (11 HM en su turno): en mantención o panne el equipo sigue
+    # contratado en obra (criterio del contrato); solo DESMOVILIZADO lo saca.
+    ESTADOS_EQUIPO_CUENTA = ("OPERANDO", "MANTENCION", "PANNE")
+    
+    
+    def cuenta_equipo(d: dict) -> bool:
+        e = norm(d.get("estado"))
+        if e in ("MANTENCION", "PANNE") or e.startswith("MANTEN"):
+            return True
+        return norm(d.get("disponible")) == "SI" and e == "OPERANDO"
+    
+    
     def operando_dia(d: dict) -> bool:
         obs = norm(d.get("observacion"))
-        return norm(d.get("disponible")) == "SI" and norm(d.get("estado")) == "OPERANDO" and not ("NOCHE" in obs and "DIA" not in obs)
+        return cuenta_equipo(d) and not ("NOCHE" in obs and "DIA" not in obs)
     
     
     def operando_noche(d: dict) -> bool:
-        return norm(d.get("disponible")) == "SI" and norm(d.get("estado")) == "OPERANDO" and norm(d.get("turno")) == "NOCHE"
+        return cuenta_equipo(d) and norm(d.get("turno")) == "NOCHE"
     
     
     def _leer_historial_master(L: "X.Libro", xa: str, dias: int = 45) -> dict:
@@ -5187,6 +5697,8 @@ def _modulo_diario():
         # Tarja de asistencia: RUT tal como está en BD Personal (mismo número con otro formato o dígito verificador)
         marcas: dict[str, Marca] = {}
         fuera_tarja = []
+        nuevos_tarja: list[tuple[str, Marca]] = []
+        finiquitados: dict[str, Marca] = {}
         if tarja:
             por_numero = {}
             for r in plantel:
@@ -5206,8 +5718,13 @@ def _modulo_diario():
                         r = cand[0]
                         avisos.append(f"Tarja: el RUT {rut} ({m.nombre}) no está en BD Personal; se asoció por nombre a {plantel[r].nombre} ({r}).")
                 if r is None:
-                    if m.estado in ("P", "T", "TN", "TT", "TC"):        # solo importa si figura trabajando
+                    if _vigente(m) and m.ficha.get("J"):
+                        nuevos_tarja.append((rut, m))              # contratado según la tarja: se agrega a BD Personal
+                    elif m.estado in ("P", "T", "TN", "TT", "TC"):     # solo importa si figura trabajando
                         fuera_tarja.append(f"{m.nombre or '–'} ({rut}: {m.texto or m.estado})")
+                    continue
+                if m.ficha and _finiquitado(m):
+                    finiquitados[r] = m
                     continue
                 marcas[r] = m
             if fuera_tarja:
@@ -5255,7 +5772,13 @@ def _modulo_diario():
         sin_reporte: dict[str, int] = {}
         sin_marca: list[str] = []
         cambios_acr: list[str] = []
+        if finiquitados:
+            avisos.append(f"{len(finiquitados)} persona(s) de BD Personal figuran FINIQUITADAS en la tarja y salen del día "
+                          "(no se cuentan como contratadas): " + "; ".join(f"{plantel[r].nombre} ({r})" for r in list(finiquitados)[:15])
+                          + (" …" if len(finiquitados) > 15 else "") + ".")
         for p in pl.personas:
+            if p.rut in finiquitados:
+                continue
             q = Persona(**p.__dict__)
             motivo = ""
             if p.rut in presentes:
@@ -5292,7 +5815,7 @@ def _modulo_diario():
                     elif not hoy and p.faena.upper() in ESTADOS_TRABAJANDO:
                         q.faena = "D"
                         motivo = f"Baja según su turno ({p.turno})"
-            if p.rut in marcas:
+            if p.rut in marcas and marcas[p.rut].estado:
                 m = marcas[p.rut]
                 antes = q.faena
                 if m.estado in ("P", "T", "TN"):
@@ -5346,6 +5869,26 @@ def _modulo_diario():
             noche = rep.turno == "Noche"
             nuevos.append({"rut": rut, "nombre": t.nombre, "cargo": t.cargo, "especialidad": esp_reporte[id(rep)],
                            "turno": "NOCHE" if noche else "DIA", "faena": "TN" if noche else "T", "archivo": rep.archivo})
+        ya = {q.rut for q in personas}
+        agregados = []
+        for rut, m in nuevos_tarja:
+            if rut in ya:
+                continue
+            f_ = m.ficha
+            noche = m.noche if m.noche is not None else norm(f_.get("H")) == "NOCHE"
+            est = m.estado or "D"
+            faena = ("TN" if noche else "T") if est == "P" else est
+            q = Persona(-1, rut, m.nombre or str(f_.get("I") or ""), str(f_.get("J") or ""), str(f_.get("K") or ""),
+                        "NOCHE" if noche else str(f_.get("H") or "DIA"), str(f_.get("W") or "Directo"),
+                        str(f_.get("AA") or m.acreditado or "SI"), str(f_.get("Z") or "CONTRATADO"), faena, str(f_.get("F") or ""),
+                        ficha=f_)
+            personas.append(q)
+            ya.add(rut)
+            agregados.append(f"{q.nombre} ({q.cargo})")
+            nuevos = [n_ for n_ in nuevos if n_["rut"] != rut]
+        if agregados:
+            avisos.append(f"{len(agregados)} persona(s) contratadas según la tarja que no estaban en BD Personal se agregaron con "
+                          "los datos de la tarja: " + "; ".join(agregados[:15]) + (" …" if len(agregados) > 15 else "") + ".")
         if nuevos:
             avisos.append(f"{len(nuevos)} persona(s) de los reportes no están en BD Personal del día anterior.")
         if agregar_nuevos:
@@ -5507,7 +6050,8 @@ def _modulo_diario():
         for rep in reportes:
             for m in getattr(rep, "materiales", []):
                 titulo = next((u.get("descripcion") for u in rep.uso_recurso if u.get("descripcion")), "")
-                materiales.append({**m, "trabajo": titulo, "solicitado": rep.supervisor or "", "observacion": rep.archivo})
+                base = {"trabajo": titulo, "solicitado": rep.supervisor or "", "observacion": rep.archivo}
+                materiales.append({**base, **{k: v for k, v in m.items() if v not in ("", None)}})
         # Interferencias y detenciones: actividades de los reportes clasificadas así (texto o historial)
         interferencias = []
         tipos_int = pl.listas.get("interferencia") or []
@@ -5644,7 +6188,35 @@ def _modulo_diario():
         }
     
     
+    def ampliar_secciones(pl: Plantilla, n_udr: int = 0, n_mat: int = 0) -> Plantilla:
+        """Si hay más UDR o más materiales que filas en sus secciones del informe, inserta las filas que faltan
+        (con su formato y fórmulas, corriendo todo lo de abajo) y vuelve a leer la planilla."""
+        falta_u = n_udr - len(pl.filas_udr) if pl.filas_udr else 0
+        filas_m = (pl.materiales or {}).get("filas") or []
+        falta_m = n_mat - len(filas_m) if filas_m else 0
+        if falta_u <= 0 and falta_m <= 0:
+            return pl
+        L = X.Libro(pl.datos)
+        hecho = False
+        # de abajo hacia arriba, para que las filas de la sección de arriba sigan siendo válidas
+        for fila, falta in sorted([(filas_m[-1] if filas_m else 0, falta_m), (pl.filas_udr[-1] if pl.filas_udr else 0, falta_u)],
+                                  reverse=True):
+            if falta > 0 and fila:
+                hecho = X.insertar_filas(L, HOJA_INFORME, fila, falta) or hecho
+        if not hecho:
+            return pl
+        nueva = leer_plantilla(L.bytes(recalcular=True))
+        if len(nueva.filas_udr) < len(pl.filas_udr) or len((nueva.materiales or {}).get("filas") or []) < len(filas_m):
+            return pl
+        return nueva
+    
+    
+    def ampliar_udr(pl: Plantilla, total: int) -> Plantilla:
+        return ampliar_secciones(pl, n_udr=total)
+    
+    
     def generar_informe(pl: Plantilla, cons: Consolidado, ent: Entradas) -> bytes:
+        pl = ampliar_secciones(pl, len(ent.uso_recurso), len(ent.materiales))
         L = X.Libro(pl.datos)
         cierre = valores_cierre(pl)
         r = pl.refs
@@ -5704,7 +6276,7 @@ def _modulo_diario():
             if pk and pk in por_patente:                       # equipo con patente: manda BD Maquinaria (siempre calzan)
                 d = por_patente[pk]
                 dia = 1 if operando_dia(d) else 0
-                if not (norm(d.get("disponible")) == "SI" and norm(d.get("estado")) == "OPERANDO"):
+                if not cuenta_equipo(d):
                     noche = 0
                 if norm(d.get("estado")) not in ("OPERANDO", "") and (cambio.get("observacion") or "") == (e.observacion or ""):
                     cambio = {**cambio, "observacion": d["estado"].capitalize() + (f": {d['observacion']}" if d.get("observacion") else "")}
@@ -6028,11 +6600,17 @@ def _modulo_diario():
             fx = pl.filas_persona_xml.get(p.fila, base)
             fx = X.quitar_formulas_relativas(X.renumerar_fila(fx, n)).replace(' hidden="1"', "")
             cambios = {"B": mes, "C": serial, "AB": p.faena, "H": p.tipo_turno}
-            if p.fila < 0:  # persona nueva: solo los datos conocidos
+            if p.fila < 0:  # persona nueva: los datos conocidos (de la tarja, si los trae)
                 vacias = {c: None for c in ("E", "F", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "X", "Y", "AC")}
                 cambios.update(vacias)
                 cambios.update({"D": p.rut, "G": "VIGENTE", "I": p.nombre, "J": p.cargo, "K": p.especialidad, "W": p.moimod,
                                 "Z": p.estatus, "AA": p.acreditado})
+                for col, val in (p.ficha or {}).items():
+                    if col in ("H", "AB"):
+                        continue
+                    if isinstance(val, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", val):
+                        val = X.fecha_a_serial(date.fromisoformat(val))
+                    cambios[col] = val
             nuevas.append(X._reemplazar_en_fila(fx, n, cambios))
         xp = X.agregar_filas_al_final(xp, nuevas)
         xp = _ocultar_y_filtrar(xp, set(pl.filas_persona_xml), fecha)
@@ -6087,7 +6665,10 @@ def _modulo_diario():
             fila = re.sub(r'<row r="\d+"', f'<row r="{n}"', fx, count=1)
             fila = re.sub(r'(<c r="[A-Z]+)\d+"', rf'\g<1>{n}"', fila)
             fila = re.sub(rf'(<c r="B{n}"[^>]*>)<v>[^<]*</v>', rf"\g<1><v>{serial}</v>", fila, count=1)
-            cambios = ent.maquinaria.get(_clave_patente(d["patente"]), {})
+            cambios = dict(ent.maquinaria.get(_clave_patente(d["patente"]), {}))
+            orig = next((o for o in pl.maquinaria if _clave_patente(o["patente"]) == _clave_patente(d["patente"])), {})
+            if d.get("disponible") != orig.get("disponible") or "disponible" in cambios:
+                cambios["disponible"] = d["disponible"]           # mantención / panne: disponible SI
             for k, val in cambios.items():
                 col = _MAQ_COLS.get(k)
                 if not col:
@@ -8134,6 +8715,2241 @@ def _modulo_desviaciones_pdf():
 desviaciones_pdf = _modulo_desviaciones_pdf()
 
 # ======================================================================
+# MÓDULO: cubicacion
+# ======================================================================
+def _modulo_cubicacion():
+    import io
+    import re
+    import unicodedata
+    from dataclasses import asdict, dataclass, field
+    from datetime import date, datetime
+    
+    DISCIPLINAS = ["Obras civiles", "Estructura", "Mecánica", "Piping", "Eléctricos"]
+    OTRAS = "Otras"
+    _RE_ITEM = re.compile(r"^\d{2}\.\d{2}\.\d{3}\.\d{3,4}[A-Z]?(\.\d+)?$")
+    _EPS = 1e-6
+    
+    
+    def norm(s) -> str:
+        s = unicodedata.normalize("NFKD", str(s if s is not None else "")).encode("ascii", "ignore").decode().upper()
+        return re.sub(r"\s+", " ", s.replace("\n", " ")).strip()
+    
+    
+    def _num(v) -> float:
+        if isinstance(v, bool) or v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v) if v == v else 0.0          # NaN → 0
+        s = str(v).strip().replace(" ", "")
+        if not s or s.startswith("#"):
+            return 0.0
+        if re.fullmatch(r"-?\d{1,3}(\.\d{3})+(,\d+)?", s):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", ".")
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+    
+    
+    def _txt(v) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return re.sub(r"\s+", " ", str(v)).strip()
+    
+    
+    def disciplina_de(especialidad: str, item: str = "") -> str:
+        """Disciplina a partir de la columna Especialidad del itemizado (o del capítulo del ítem si viene vacía)."""
+        e = norm(especialidad)
+        if "CIVIL" in e:
+            return "Obras civiles"
+        if "ESTRUC" in e:
+            return "Estructura"
+        if "MECAN" in e:
+            return "Mecánica"
+        if "CANER" in e or "PIPING" in e:
+            return "Piping"
+        if "ELECTR" in e or "INSTRUM" in e:
+            return "Eléctricos"
+        if e:
+            return OTRAS
+        cap = item[:2]
+        return {"00": "Obras civiles", "10": "Obras civiles", "20": "Estructura", "30": "Mecánica", "40": "Mecánica",
+                "50": "Mecánica", "51": "Piping", "52": "Piping", "53": "Piping", "81": "Piping",
+                "60": "Eléctricos", "70": "Eléctricos"}.get(cap, OTRAS)
+    
+    
+    @dataclass
+    class ItemCub:
+        item: str
+        disciplina: str
+        especialidad: str = ""
+        hoja_control: str = ""
+        descripcion: str = ""
+        unidad: str = ""
+        contrato: float = 0.0        # cantidad del contrato (itemizado EC-002)
+        rend: float = 0.0            # HH por unidad
+        pom: float = 0.0             # cubicación POM
+        anterior: float = 0.0        # avance acumulado weekly de la semana anterior
+        acumulado: float = 0.0       # avance acumulado weekly a la fecha
+        edp: float = 0.0             # avance acumulado EDP
+        planilla: str = ""           # archivo de origen
+    
+        @property
+        def semana(self) -> float:
+            return self.acumulado - self.anterior
+    
+        @property
+        def pom_fuera_de_escala(self) -> bool:
+            # POM 20 veces sobre el contrato y un avance que sigue al contrato (no al POM): error de digitación
+            return self.contrato > _EPS and self.pom > self.contrato * 20 and self.acumulado <= self.contrato * 1.5
+    
+        @property
+        def pom_valida(self) -> float:
+            """POM para calcular HH; si está fuera de escala (error de la planilla) se usa la cantidad del contrato."""
+            return self.contrato if self.pom_fuera_de_escala else self.pom
+    
+        @property
+        def hh_pom(self) -> float:
+            return self.pom_valida * self.rend
+    
+        @property
+        def hh_ganadas(self) -> float:
+            return self.acumulado * self.rend
+    
+    
+    @dataclass
+    class FilaDetalle:
+        hoja: str
+        fila: int
+        item: str
+        plano: str = ""
+        rev: str = ""
+        tag: str = ""
+        descripcion: str = ""
+        unidad: str = ""
+        cantidad: float | None = None      # cubicación de la fila (POM / peso total / cantidad)
+        acumulado: float | None = None     # avance acumulado weekly de la fila (si la hoja lo trae)
+    
+    
+    @dataclass
+    class Hallazgo:
+        disciplina: str
+        tipo: str
+        item: str
+        detalle: str
+        planilla: str = ""
+        gravedad: str = "Revisar"          # «Error», «Revisar» o «Info»
+    
+    
+    @dataclass
+    class PlanillaCub:
+        archivo: str
+        hoja_itemizado: str
+        items: dict[str, ItemCub] = field(default_factory=dict)
+        detalle: list[FilaDetalle] = field(default_factory=list)
+        hojas_detalle: dict[str, str] = field(default_factory=dict)     # hoja → aviso de lectura ("" = ok)
+        hallazgos: list[Hallazgo] = field(default_factory=list)
+        fecha: str = ""                                                 # fecha de corte deducida del nombre (dd-mm-aaaa)
+    
+        @property
+        def disciplinas(self) -> list[str]:
+            vistas = {it.disciplina for it in self.items.values()}
+            return [d for d in DISCIPLINAS + [OTRAS] if d in vistas]
+    
+        def a_dict(self) -> dict:
+            return {"archivo": self.archivo, "hoja_itemizado": self.hoja_itemizado, "fecha": self.fecha,
+                    "items": [asdict(i) for i in self.items.values()], "detalle": [asdict(f) for f in self.detalle],
+                    "hojas_detalle": self.hojas_detalle, "hallazgos": [asdict(h) for h in self.hallazgos]}
+    
+        @classmethod
+        def de_dict(cls, d: dict) -> "PlanillaCub":
+            p = cls(d["archivo"], d.get("hoja_itemizado", ""), fecha=d.get("fecha", ""))
+            p.items = {i["item"]: ItemCub(**i) for i in d.get("items", [])}
+            p.detalle = [FilaDetalle(**f) for f in d.get("detalle", [])]
+            p.hojas_detalle = dict(d.get("hojas_detalle", {}))
+            p.hallazgos = [Hallazgo(**h) for h in d.get("hallazgos", [])]
+            return p
+    
+    
+    def fecha_de_nombre(nombre: str) -> str:
+        """Última fecha dd-mm-aaaa del nombre del archivo («… (24-10-2026 al 30-10-2026)» → 30-10-2026)."""
+        f = re.findall(r"(\d{1,2})[-_.](\d{1,2})[-_.](\d{4})", nombre or "")
+        if not f:
+            return ""
+        d, m, a = f[-1]
+        try:
+            return date(int(a), int(m), int(d)).strftime("%d-%m-%Y")
+        except ValueError:
+            return ""
+    
+    
+    # ------------------------------------------------------------------ lectura
+    
+    def _abrir(datos: bytes):
+        import openpyxl
+        return openpyxl.load_workbook(io.BytesIO(datos), read_only=True, data_only=True)
+    
+    
+    def _filas(ws, max_col=120, max_row=6000):
+        return [list(r) for r in ws.iter_rows(min_row=1, max_row=max_row, max_col=max_col, values_only=True)]
+    
+    
+    def _hoja_itemizado(wb) -> str | None:
+        return next((h for h in wb.sheetnames if norm(h) == "ITEMIZADO"), None) or \
+            next((h for h in wb.sheetnames if "ITEMIZADO" in norm(h)), None)
+    
+    
+    def _leer_itemizado(filas: list[list]) -> list[dict]:
+        """Filas del itemizado EC-002 con sus columnas (por nombre de columna)."""
+        f_cab = None
+        for i, r in enumerate(filas[:60]):
+            n = [norm(v) for v in r]
+            es_cab = "ITEM" in n and any(x.startswith("ESPECIALIDA") for x in n)
+            if es_cab:
+                f_cab = i          # si la fila siguiente repite los títulos (títulos en dos filas), manda la de abajo
+            elif f_cab is not None:
+                break
+        if f_cab is None:
+            raise ValueError("no se encontró la fila de títulos del itemizado (columnas «Especialidad» e «Ítem»).")
+        cab = [norm(v) for v in filas[f_cab]]
+    
+        def col(*pref, desde=0):
+            for p in pref:
+                for j in range(desde, len(cab)):
+                    if cab[j] == p or (p.endswith("*") and cab[j].startswith(p[:-1])):
+                        return j
+            return None
+    
+        c_item, c_esp = cab.index("ITEM"), col("ESPECIALIDA*")
+        c_ctrl, c_desc, c_un = col("PLANILLA DE CONTROL*"), col("DESCRIPCION"), col("UNIDAD")
+        c_cant, c_rend, c_pom = col("CANTIDAD"), col("RENDIMIENTO"), col("CUBICACION*")
+        # grupos de avance en la fila de arriba: el 1.er «AVANCE ACUMULADO» es WEEKLY, el 2.º es EDP
+        acu, ant = [], []
+        for fg in range(f_cab - 1, max(f_cab - 4, -1), -1):
+            grupos = [norm(v) for v in filas[fg]]
+            acu = [j for j, g in enumerate(grupos) if g.startswith("AVANCE ACUMULADO") or g.startswith("AVNCE ACUMULADO")]
+            ant = [j for j, g in enumerate(grupos) if g.startswith("AVANCE ANTERIOR")]
+            if acu:
+                break
+        if not acu:
+            raise ValueError("no se encontró el grupo «AVANCE ACUMULADO» en el itemizado.")
+    
+        def cant_de(j):           # la columna CANT del grupo (o la del propio título del grupo)
+            return next((k for k in range(j, min(j + 3, len(cab))) if cab[k].startswith("CANT")), j)
+    
+        c_acu, c_ant = cant_de(acu[0]), (cant_de(ant[0]) if ant else None)
+        c_edp = cant_de(acu[1]) if len(acu) > 1 else None
+    
+        def hh_de(c):              # la columna «HH GAN» que sigue a una CANT
+            if c is None:
+                return None
+            return next((k for k in range(c + 1, min(c + 3, len(cab))) if cab[k].startswith("HH GAN")), None)
+    
+        h_acu, h_ant = hh_de(c_acu), hh_de(c_ant)
+        out = []
+        for i in range(f_cab + 1, len(filas)):
+            r = filas[i]
+            g = lambda j: r[j] if j is not None and j < len(r) else None
+            item = _txt(g(c_item))
+            if not _RE_ITEM.match(item):
+                continue
+            rend = _num(g(c_rend))
+            anterior, acumulado = _num(g(c_ant)), _num(g(c_acu))
+            # algunas planillas (mecánica) dejan la CANT en blanco y solo llenan las HH ganadas: cantidad = HH / rend.
+            if abs(anterior) < _EPS and rend > _EPS and abs(_num(g(h_ant))) > _EPS:
+                anterior = _num(g(h_ant)) / rend
+            if abs(acumulado) < _EPS and rend > _EPS and abs(_num(g(h_acu))) > _EPS:
+                acumulado = _num(g(h_acu)) / rend
+            out.append({"fila": i + 1, "item": item, "especialidad": _txt(g(c_esp)), "control": _txt(g(c_ctrl)),
+                        "descripcion": _txt(g(c_desc)), "unidad": _txt(g(c_un)), "contrato": _num(g(c_cant)),
+                        "rend": rend, "pom": _num(g(c_pom)), "anterior": anterior,
+                        "acumulado": acumulado, "edp": _num(g(c_edp))})
+        if not out:
+            raise ValueError("el itemizado no tiene ítems del EC-002.")
+        return out
+    
+    
+    # columnas de las hojas de control (por el título normalizado)
+    def _buscar(cab: list[str], reglas) -> int | None:
+        for regla in reglas:
+            for j, t in enumerate(cab):
+                if t and regla(t):
+                    return j
+        return None
+    
+    
+    def _cabecera_detalle(filas) -> tuple[int, int] | None:
+        """(fila de títulos, columna del ítem): la columna con más códigos EC-002 y la fila de títulos sobre el 1.er dato."""
+        conteo: dict[int, list[int]] = {}
+        for i, r in enumerate(filas[:400]):
+            for j, v in enumerate(r[:40]):
+                if v is not None and _RE_ITEM.match(_txt(v)):
+                    conteo.setdefault(j, []).append(i)
+        if not conteo:
+            return None
+        j = max(conteo, key=lambda k: len(conteo[k]))
+        r0 = conteo[j][0]
+        for i in range(r0 - 1, max(r0 - 6, -1), -1):
+            textos = sum(1 for v in filas[i] if isinstance(v, str) and re.search("[A-Za-z]{2}", v))
+            if textos >= 5:
+                return i, j
+        return None
+    
+    
+    def _leer_hoja_detalle(nombre: str, filas: list[list]) -> tuple[list[FilaDetalle], str]:
+        cab_ = _cabecera_detalle(filas)
+        if cab_ is None:
+            return [], "sin filas con ítem del EC-002"
+        i, c_item = cab_
+        cab = [norm(v) for v in filas[i]]
+        c_plano = _buscar(cab, [lambda t: t in ("N DE ISOMETRICO", "N ISOMETRICO") or t.startswith("N DE ISOMETRICO"),
+                                lambda t: t.startswith("PLANO DETALLE"), lambda t: t.startswith("PLANO"),
+                                lambda t: t in ("N DE PLANO", "NDE PLANO", "NPLANO"), lambda t: t == "DWG"])
+        c_rev = None
+        if c_plano is not None:
+            c_rev = next((j for j in range(c_plano + 1, min(c_plano + 3, len(cab))) if cab[j].startswith("REV")), None)
+        c_tag = _buscar(cab, [lambda t: t == "TAG", lambda t: t == "C ID" or t == "C_ID", lambda t: t.startswith("TAG")])
+        c_desc = _buscar(cab, [lambda t: t in ("DESCRIPCION", "DESCRIPSION"),
+                               lambda t: t.startswith("DESCRIPCION MAT") or t == "DESCRIPCION 1",
+                               lambda t: t.startswith("DESCRIPCION /") or t.startswith("DESIGNACION"),
+                               lambda t: t.startswith("ELEMENTO"), lambda t: t.startswith("EQUIPO / ELEMENTO")])
+        c_elem = _buscar(cab, [lambda t: t.startswith("EQUIPO / ELEMENTO"), lambda t: t == "ELEMENTO",
+                               lambda t: t.startswith("ELEMENTO /")])
+        if c_elem == c_desc:
+            c_elem = None
+        c_un = _buscar(cab, [lambda t: t.startswith("UNIDAD"), lambda t: t == "UND"])
+        c_cant = _buscar(cab, [lambda t: t.startswith("POM"), lambda t: t == "PESO TOTAL", lambda t: t == "CUBICACION",
+                               lambda t: t.startswith("CUBICACION PLANO"), lambda t: t.startswith("QUANTITY"),
+                               lambda t: t.startswith("CANTIDAD MTS") or t.startswith("CANTIDAD _MTS"),
+                               lambda t: t in ("CANT", "CANT.", "CANTIDAD"), lambda t: t == "QTY"])
+        c_acu = _buscar(cab, [lambda t: t.startswith("CANTIDAD WEEKLY ACUMULADO"), lambda t: t == "AV TOTAL ACUMULADO",
+                              lambda t: t.startswith("TOTAL ACUMULADO"), lambda t: t == "AVANCE ACUMULADO"])
+        filas_out = []
+        for k in range(i + 1, len(filas)):
+            r = filas[k]
+            g = lambda j: r[j] if j is not None and j < len(r) else None
+            item = _txt(g(c_item))
+            if not _RE_ITEM.match(item):
+                continue
+            filas_out.append(FilaDetalle(
+                hoja=nombre, fila=k + 1, item=item, plano=_txt(g(c_plano)), rev=_txt(g(c_rev)), tag=_txt(g(c_tag)),
+                descripcion=" · ".join(dict.fromkeys(x for x in (_txt(g(c_desc)), _txt(g(c_elem))) if x))[:140],
+                unidad=_txt(g(c_un)),
+                cantidad=_num(g(c_cant)) if c_cant is not None else None,
+                acumulado=_num(g(c_acu)) if c_acu is not None else None))
+        aviso = "" if filas_out else "sin filas con ítem"
+        if filas_out and c_acu is None:
+            aviso = "sin columna de avance acumulado reconocible"
+        return filas_out, aviso
+    
+    
+    def _clave_hoja(s) -> str:
+        return re.sub(r"[^A-Z0-9]", "", norm(s))
+    
+    
+    def _resolver_hoja(nombre: str, hojas: list[str]) -> str | None:
+        """Hoja del archivo que corresponde a la «Planilla de control» (tolera espacios, guiones y sufijos)."""
+        k = _clave_hoja(nombre)
+        if not k:
+            return None
+        exactas = [h for h in hojas if _clave_hoja(h) == k]
+        if exactas:
+            return exactas[0]
+        pref = [h for h in hojas if _clave_hoja(h).startswith(k) or (len(_clave_hoja(h)) > 4 and k.startswith(_clave_hoja(h)))]
+        return pref[0] if pref else None
+    
+    
+    def leer_planilla(datos: bytes, archivo: str = "", con_detalle: bool = True) -> PlanillaCub:
+        """Lee una planilla de avance (cualquier disciplina): itemizado + hojas de control que usa."""
+        wb = _abrir(datos)
+        try:
+            h_itm = _hoja_itemizado(wb)
+            if not h_itm:
+                raise ValueError("no tiene la hoja de itemizado EC-002 («Itemizado»).")
+            filas = _leer_itemizado(_filas(wb[h_itm], max_col=80, max_row=3000))
+            resol = {f["control"]: _resolver_hoja(f["control"], wb.sheetnames) for f in filas if f["control"]}
+            p = PlanillaCub(archivo, h_itm, fecha=fecha_de_nombre(archivo))
+            controladas = [f for f in filas if resol.get(f["control"])]
+            principales = {disciplina_de(f["especialidad"], f["item"]) for f in controladas}
+            for f in filas:
+                disc = disciplina_de(f["especialidad"], f["item"])
+                propia = bool(resol.get(f["control"]))
+                con_avance = abs(f["acumulado"]) > _EPS or abs(f["anterior"]) > _EPS
+                # sin hoja de control: solo se toma si tiene avance y es de una disciplina que esta planilla controla
+                # (las demás filas son copia del itemizado de otras especialidades)
+                if not propia and not (con_avance and (disc in principales or not principales)):
+                    continue
+                it = p.items.get(f["item"])
+                if it is None:
+                    p.items[f["item"]] = ItemCub(
+                        item=f["item"], disciplina=disc, especialidad=f["especialidad"],
+                        hoja_control=(resol.get(f["control"]) or f["control"]).strip(), descripcion=f["descripcion"],
+                        unidad=f["unidad"], contrato=f["contrato"], rend=f["rend"], pom=f["pom"], anterior=f["anterior"],
+                        acumulado=f["acumulado"], edp=f["edp"], planilla=archivo)
+                else:                      # ítem repetido en el itemizado (filas partidas): se suman cantidades
+                    for k in ("contrato", "pom", "anterior", "acumulado", "edp"):
+                        setattr(it, k, getattr(it, k) + f[k])
+            if not p.items:
+                raise ValueError("ningún ítem del itemizado está controlado por esta planilla (sin «Planilla de control» "
+                                 "ni avance).")
+            if con_detalle:
+                usadas = [h for h in wb.sheetnames if h.strip() in {it.hoja_control for it in p.items.values()}]
+                for h in usadas:
+                    try:
+                        ws = wb[h]
+                        filas_d, aviso = _leer_hoja_detalle(h.strip(), _filas(ws, max_col=110, max_row=5000))
+                    except Exception as e:                   # una hoja rara no debe botar toda la planilla
+                        filas_d, aviso = [], f"no se pudo leer ({e})"
+                    p.detalle += filas_d
+                    p.hojas_detalle[h.strip()] = aviso
+            p.hallazgos = revisar(p)
+            return p
+        finally:
+            wb.close()
+    
+    
+    # ------------------------------------------------------------------ revisión
+    
+    def revisar(p: PlanillaCub) -> list[Hallazgo]:
+        """Errores típicos de una planilla de avance."""
+        H = []
+        a = lambda disc, tipo, item, det, grav="Revisar": H.append(Hallazgo(disc, tipo, item, det, p.archivo, grav))
+        for it in p.items.values():
+            d = it.disciplina
+            if it.pom_valida > _EPS and it.acumulado > it.pom_valida * 1.01 + 1e-3:
+                a(d, "Avance mayor que la cubicación", it.item,
+                  f"Acumulado {_f(it.acumulado)} {it.unidad} > POM {_f(it.pom_valida)} "
+                  f"({it.acumulado / it.pom_valida:.0%}).", "Error")
+            if it.pom <= _EPS and it.acumulado > _EPS:
+                a(d, "Avance sin cubicación", it.item, f"Acumulado {_f(it.acumulado)} {it.unidad} y POM en 0.", "Error")
+            if it.acumulado < it.anterior - 1e-3:
+                a(d, "Retroceso", it.item, f"Acumulado {_f(it.acumulado)} menor que el anterior {_f(it.anterior)}.",
+                  "Error")
+            if it.pom_fuera_de_escala:
+                a(d, "POM fuera de escala", it.item,
+                  f"POM {_f(it.pom)} vs contrato {_f(it.contrato)} {it.unidad}: parece un error de la planilla. Para las HH "
+                  f"se usa la cantidad del contrato.", "Error")
+            elif it.contrato > _EPS and it.pom > it.contrato * 1.10:
+                a(d, "Mayor obra (POM sobre contrato)", it.item,
+                  f"POM {_f(it.pom)} vs contrato {_f(it.contrato)} {it.unidad} (+{it.pom / it.contrato - 1:.0%}).", "Info")
+            if it.rend <= _EPS and it.pom > _EPS:
+                a(d, "Sin rendimiento", it.item, "El ítem tiene cubicación pero rendimiento 0: no suma HH.")
+        for disc in p.disciplinas:
+            con = [i for i in p.items.values() if i.disciplina == disc and i.acumulado > _EPS]
+            sin_ant = [i for i in con if abs(i.anterior) < _EPS]
+            if len(con) > 2 and len(sin_ant) >= 0.8 * len(con):
+                a(disc, "Planilla sin avance anterior", "",
+                  f"{len(sin_ant)} de {len(con)} ítems con avance no traen «AVANCE ANTERIOR»: el avance de la semana se "
+                  f"calcula contra la carga anterior guardada en la app.")
+        # detalle vs itemizado
+        por_item: dict[str, list[FilaDetalle]] = {}
+        for f in p.detalle:
+            por_item.setdefault(f.item, []).append(f)
+        for item, fs in por_item.items():
+            it = p.items.get(item)
+            hoja = fs[0].hoja
+            if it is None:
+                a(disciplina_de("", item), "Ítem del detalle fuera del itemizado", item,
+                  f"La hoja «{hoja}» usa el ítem {item}, que esta planilla no controla en su itemizado.")
+                continue
+            acus = [f.acumulado for f in fs if f.acumulado is not None]
+            if acus and len(acus) == len(fs) and norm(hoja) == norm(it.hoja_control):
+                s = sum(acus)
+                if abs(s - it.acumulado) > max(0.01, abs(it.acumulado) * 0.005):
+                    a(it.disciplina, "Detalle no cuadra con el itemizado", item,
+                      f"«{hoja}» suma {_f(s)} pero el itemizado dice {_f(it.acumulado)} {it.unidad}.", "Error")
+            # mismo TAG con la misma descripción y plano: fila duplicada (un equipo con varios componentes es normal)
+            tags: dict[tuple, list[int]] = {}
+            for f in fs:
+                if f.tag and len(f.tag) > 3:
+                    tags.setdefault((norm(f.tag), norm(f.descripcion), norm(f.plano)), []).append(f.fila)
+            for (tag, _, _), filas in tags.items():
+                if len(filas) > 1:
+                    a(it.disciplina, "TAG repetido", item,
+                      f"TAG {tag} aparece {len(filas)} veces con la misma descripción en «{hoja}» "
+                      f"(filas {', '.join(map(str, filas[:6]))}).")
+            sin_plano = [f.fila for f in fs if not f.plano]
+            if sin_plano and len(sin_plano) < len(fs):
+                a(it.disciplina, "Fila sin plano", item,
+                  f"{len(sin_plano)} fila(s) de «{hoja}» sin plano de referencia (p. ej. fila {sin_plano[0]}).")
+        for it in p.items.values():
+            if it.hoja_control and norm(it.hoja_control) not in {norm(h) for h in p.hojas_detalle} and it.acumulado > _EPS:
+                a(it.disciplina, "Sin hoja de control", it.item,
+                  f"Tiene avance pero su planilla de control «{it.hoja_control}» no está en el archivo.")
+        return H
+    
+    
+    def cruzar(planillas: list[PlanillaCub]) -> list[Hallazgo]:
+        """Ítems con avance en más de una planilla (doble conteo)."""
+        vistos: dict[str, list[tuple[str, float, str]]] = {}
+        for p in planillas:
+            for it in p.items.values():
+                if abs(it.acumulado) > _EPS:
+                    vistos.setdefault(it.item, []).append((p.archivo, it.acumulado, it.disciplina))
+        H = []
+        for item, v in vistos.items():
+            if len({x[0] for x in v}) > 1:
+                H.append(Hallazgo(v[0][2], "Ítem en dos planillas", item,
+                                  "Con avance en: " + "; ".join(f"{a} ({_f(c)})" for a, c, _ in v)
+                                  + ". Se usa la primera.", "", "Error"))
+        return H
+    
+    
+    def _f(x: float) -> str:
+        s = f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return s[:-3] if s.endswith(",00") else s
+    
+    
+    # ------------------------------------------------------------------ consolidado
+    
+    def consolidar(planillas: list[PlanillaCub]) -> dict[str, ItemCub]:
+        """Un ítem por código (si viene en dos planillas manda la primera cargada)."""
+        out: dict[str, ItemCub] = {}
+        for p in planillas:
+            for k, it in p.items.items():
+                out.setdefault(k, it)
+        return out
+    
+    
+    def resumen_disciplinas(items: dict[str, ItemCub]) -> list[dict]:
+        filas = []
+        for d in DISCIPLINAS + [OTRAS]:
+            its = [i for i in items.values() if i.disciplina == d]
+            if not its and d == OTRAS:
+                continue
+            hh_pom = sum(i.hh_pom for i in its)
+            hh_gan = sum(i.hh_ganadas for i in its)
+            hh_ant = sum(i.anterior * i.rend for i in its)
+            filas.append({"disciplina": d, "items": len(its), "hh_contrato": sum(i.contrato * i.rend for i in its),
+                          "hh_pom": hh_pom, "hh_ganadas": hh_gan, "hh_semana": hh_gan - hh_ant,
+                          "avance": hh_gan / hh_pom if hh_pom > _EPS else 0.0,
+                          "avance_anterior": hh_ant / hh_pom if hh_pom > _EPS else 0.0,
+                          "con_avance_semana": sum(1 for i in its if i.semana > 1e-6)})
+        return filas
+    
+    
+    def excel_resumen(planillas: list[PlanillaCub], fecha: str = "") -> bytes:
+        """Consolidado descargable: resumen por disciplina, ítems, detalle y revisión."""
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        items = consolidar(planillas)
+        wb = openpyxl.Workbook()
+        F, FB = Font(name="Arial", size=10), Font(name="Arial", size=10, bold=True, color="FFFFFF")
+        FILL = PatternFill("solid", fgColor="06205C")
+    
+        def hoja(ws, titulo, cols, filas, anchos, fmt=None):
+            ws["A1"] = titulo
+            ws["A1"].font = Font(name="Arial", size=13, bold=True, color="06205C")
+            for j, c in enumerate(cols, 1):
+                x = ws.cell(3, j, c)
+                x.font, x.fill = FB, FILL
+                x.alignment = Alignment(wrap_text=True, vertical="center")
+            for i, r in enumerate(filas, 4):
+                for j, v in enumerate(r, 1):
+                    x = ws.cell(i, j, v)
+                    x.font = F
+                    if fmt and j in fmt:
+                        x.number_format = fmt[j]
+            for j, w in enumerate(anchos, 1):
+                ws.column_dimensions[get_column_letter(j)].width = w
+            ws.freeze_panes = "A4"
+            return 4 + len(filas)
+    
+        ws = wb.active
+        ws.title = "Resumen"
+        res = resumen_disciplinas(items)
+        n = len(res)
+        filas = []
+        for k, r in enumerate(res):
+            f = 4 + k
+            filas.append([r["disciplina"], r["items"], r["hh_contrato"], r["hh_pom"], r["hh_ganadas"], r["hh_semana"],
+                          f"=IF(D{f}=0,0,E{f}/D{f})"])
+        fin = hoja(ws, f"Avance por disciplina{' al ' + fecha if fecha else ''}",
+                   ["Disciplina", "Ítems", "HH contrato", "HH POM", "HH ganadas acum.", "HH ganadas semana", "% avance (HH)"],
+                   filas, [18, 8, 14, 14, 16, 16, 13], {3: "#,##0", 4: "#,##0", 5: "#,##0", 6: "#,##0", 7: "0.0%"})
+        ws.cell(fin, 1, "TOTAL").font = Font(name="Arial", size=10, bold=True)
+        for j, L in ((2, "B"), (3, "C"), (4, "D"), (5, "E"), (6, "F")):
+            ws.cell(fin, j, f"=SUM({L}4:{L}{fin - 1})").number_format = "#,##0"
+        ws.cell(fin, 7, f"=IF(D{fin}=0,0,E{fin}/D{fin})").number_format = "0.0%"
+        ws.cell(fin + 2, 1, "HH = cantidad × rendimiento del itemizado EC-002. Fuente: " +
+                "; ".join(p.archivo for p in planillas)).font = Font(name="Arial", size=9, italic=True)
+        _ = n
+    
+        ws = wb.create_sheet("Ítems")
+        filas = []
+        for k, i in enumerate(sorted(items.values(), key=lambda x: (DISCIPLINAS.index(x.disciplina)
+                                                                    if x.disciplina in DISCIPLINAS else 9, x.item))):
+            f = 4 + k
+            filas.append([i.disciplina, i.item, i.descripcion, i.unidad, i.contrato, i.pom, i.anterior, i.acumulado,
+                          f"=H{f}-G{f}", f"=IF(F{f}=0,0,H{f}/F{f})", i.rend, f"=F{f}*K{f}", f"=H{f}*K{f}", i.hoja_control,
+                          i.planilla])
+        hoja(ws, "Ítems por disciplina", ["Disciplina", "Ítem", "Descripción", "Unidad", "Cantidad contrato", "POM",
+                                          "Acum. anterior", "Acum. actual", "Semana", "% avance", "Rend. HH/u", "HH POM",
+                                          "HH ganadas", "Planilla de control", "Archivo"],
+             filas, [14, 17, 46, 7, 12, 12, 12, 12, 11, 9, 9, 11, 11, 24, 30],
+             {5: "#,##0.00", 6: "#,##0.00", 7: "#,##0.00", 8: "#,##0.00", 9: "#,##0.00", 10: "0.0%", 11: "0.000",
+              12: "#,##0", 13: "#,##0"})
+    
+        ws = wb.create_sheet("Detalle")
+        filas = [[p.items[f.item].disciplina if f.item in p.items else "", f.hoja, f.fila, f.item, f.plano, f.rev, f.tag,
+                  f.descripcion, f.unidad, f.cantidad, f.acumulado] for p in planillas for f in p.detalle]
+        hoja(ws, "Detalle de las hojas de control", ["Disciplina", "Hoja", "Fila", "Ítem", "Plano", "Rev", "TAG",
+                                                      "Descripción / elemento", "Unidad", "Cubicación", "Acumulado"],
+             filas, [14, 24, 6, 17, 30, 5, 18, 46, 7, 12, 12], {10: "#,##0.00", 11: "#,##0.00"})
+    
+        ws = wb.create_sheet("Revisión")
+        hall = [h for p in planillas for h in p.hallazgos] + cruzar(planillas)
+        hoja(ws, "Revisión de las planillas", ["Gravedad", "Disciplina", "Tipo", "Ítem", "Detalle", "Planilla"],
+             [[h.gravedad, h.disciplina, h.tipo, h.item, h.detalle, h.planilla] for h in hall], [9, 14, 30, 17, 80, 34])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    
+    
+    def excel_tablas(tablas: dict, titulo: str = "") -> bytes:
+        """Excel simple con una hoja por tabla (DataFrames), títulos en azul SYNCORE y totales de las columnas numéricas."""
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        F, FB = Font(name="Arial", size=10), Font(name="Arial", size=10, bold=True, color="FFFFFF")
+        for nombre, df in tablas.items():
+            ws = wb.create_sheet(str(nombre)[:31])
+            ws["A1"] = f"{titulo} · {nombre}" if titulo else str(nombre)
+            ws["A1"].font = Font(name="Arial", size=13, bold=True, color="06205C")
+            cols = list(df.columns)
+            for j, c in enumerate(cols, 1):
+                x = ws.cell(3, j, str(c))
+                x.font, x.fill = FB, PatternFill("solid", fgColor="06205C")
+                x.alignment = Alignment(wrap_text=True, vertical="center")
+            n = len(df)
+            for i, fila in enumerate(df.itertuples(index=False), 4):
+                for j, v in enumerate(fila, 1):
+                    if v is not None and isinstance(v, float) and v != v:
+                        v = None
+                    x = ws.cell(i, j, v.item() if hasattr(v, "item") else v)
+                    x.font = F
+                    if isinstance(v, float):
+                        x.number_format = "#,##0.00"
+            if n:
+                ws.cell(4 + n, 1, "TOTAL").font = Font(name="Arial", size=10, bold=True)
+                for j, c in enumerate(cols, 1):
+                    if j > 1 and str(df[c].dtype).startswith("float") and str(c).lower() not in ("fila", "rev", "% avance"):
+                        L = get_column_letter(j)
+                        x = ws.cell(4 + n, j, f"=SUM({L}4:{L}{3 + n})")
+                        x.font, x.number_format = Font(name="Arial", size=10, bold=True), "#,##0.00"
+            for j, c in enumerate(cols, 1):
+                largo = max([len(str(c))] + [len(str(v)) for v in df[c].head(200)]) if n else len(str(c))
+                ws.column_dimensions[get_column_letter(j)].width = min(60, max(8, largo + 2))
+            ws.freeze_panes = "A4"
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    
+    
+    def fecha_texto(d: date | datetime | str) -> str:
+        return d.strftime("%d-%m-%Y") if hasattr(d, "strftime") else str(d)
+
+    return SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
+
+
+cubicacion = _modulo_cubicacion()
+
+# ======================================================================
+# MÓDULO: cubicar_plano
+# ======================================================================
+def _modulo_cubicar_plano():
+    import io
+    import re
+    from dataclasses import dataclass
+    
+    CUB = cubicacion
+    
+    norm = CUB.norm
+    _num = CUB._num
+    
+    # ------------------------------------------------------------------ plantillas por disciplina
+    # columnas: (nombre, tipo, ayuda). Tipos: "texto", "num", "tipo" (lista TIPOS[disciplina])
+    COMUNES_INI = [("Lámina", "texto", "Lámina u hoja del plano (p. ej. 1 DE 5)"),
+                   ("Tipo", "tipo", "Qué se está cubicando: define cómo se calcula la cantidad")]
+    COMUNES_FIN = [("Ítem EC-002", "item", "Opcional: si lo dejas en blanco, la app propone uno"),
+                   ("Observación", "texto", "")]
+    
+    PLANTILLAS: dict[str, list[tuple[str, str, str]]] = {
+        "Piping": COMUNES_INI + [
+            ("NPS", "texto", 'Diámetro nominal, p. ej. 24" o 2"'),
+            ("Descripción", "texto", "Como aparece en el BOM (PIPE .500 WALL…, BALL 300# RF…, S608CB6…)"),
+            ("ID / Spool", "texto", "ID del corte, TAG de válvula o spool"),
+            ("Cantidad", "num", "N° de piezas (en cañería, deja 1 por corte)"),
+            ("Largo (mm)", "num", "Largo del corte de cañería en mm (tabla CUT PIPE LENGTHS)"),
+            ("kg c/u", "num", "Peso por soporte en kg (si el ítem se paga por kg)"),
+        ] + COMUNES_FIN,
+        "Obras civiles": COMUNES_INI + [
+            ("Elemento", "texto", "Fundación, pedestal, losa, zanja…"),
+            ("Cantidad", "num", "N° de elementos iguales"),
+            ("Largo (m)", "num", ""), ("Ancho (m)", "num", ""), ("Alto (m)", "num", "Alto o espesor"),
+            ("Descuento (m³)", "num", "Volumen a descontar (huecos, pedestales…)"),
+            ("kg c/u", "num", "Para armadura, pernos o insertos pagados por kg"),
+        ] + COMUNES_FIN,
+        "Estructura": COMUNES_INI + [
+            ("Marca", "texto", "Marca o pieza del plano"),
+            ("Perfil", "texto", "HEB 300, L 50x50x5, grating…"),
+            ("Cantidad", "num", "N° de piezas"),
+            ("Largo (m)", "num", "Largo de cada pieza"),
+            ("kg/m", "num", "Peso lineal del perfil"),
+            ("kg c/u", "num", "Peso por pieza (si lo trae la lista de materiales, manda sobre largo × kg/m)"),
+        ] + COMUNES_FIN,
+        "Mecánica": COMUNES_INI + [
+            ("TAG", "texto", "TAG del equipo"),
+            ("Equipo", "texto", "Descripción del equipo o componente"),
+            ("Cantidad", "num", "N° de unidades"),
+            ("Peso (ton)", "num", "Peso por unidad, informativo"),
+        ] + COMUNES_FIN,
+        "Eléctricos": COMUNES_INI + [
+            ("TAG / circuito", "texto", "TAG del cable, tramo o equipo"),
+            ("Descripción", "texto", "Sección, tipo de cable, tamaño de escalerilla…"),
+            ("Cantidad", "num", "N° de tramos o unidades"),
+            ("Largo (m)", "num", "Largo de cada tramo (cables, escalerillas, conduit, malla)"),
+        ] + COMUNES_FIN,
+    }
+    
+    # tipo → cómo se calcula ("m_mm" metros desde mm, "m", "m2", "m3", "kg", "un")
+    TIPOS: dict[str, dict[str, str]] = {
+        "Piping": {"Cañería": "m_mm", "Válvula": "un", "Soporte": "kg_o_un", "Fitting": "un", "Flange": "un",
+                   "Olet": "un", "Perno / empaquetadura": "un", "Aislación": "m_mm", "Otro": "un"},
+        "Obras civiles": {"Excavación": "m3", "Relleno": "m3", "Emplantillado": "m3", "Hormigón": "m3",
+                          "Mortero / grout": "m3", "Moldaje": "m2", "Geomembrana": "m2", "Armadura": "kg",
+                          "Pernos / insertos (kg)": "kg", "Pernos / insertos (un)": "un", "Prefabricado": "un", "Otro": "un"},
+        "Estructura": {"Perfil / pieza": "kg", "Grating / piso": "kg", "Baranda / escalera": "kg", "Otro (un)": "un"},
+        "Mecánica": {"Equipo": "un", "Componente": "un", "Otro": "un"},
+        "Eléctricos": {"Cable": "m", "Escalerilla / bandeja": "m", "Conduit": "m", "Banco de ductos": "m",
+                       "Malla a tierra": "m", "Soldadura exotérmica": "un", "Luminaria": "un", "Tablero / equipo": "un",
+                       "Soporte": "un", "Otro": "un"},
+    }
+    # materiales que van incluidos en el metro de cañería: se listan, pero no tienen ítem de HH propio
+    SIN_ITEM = {"Fitting", "Flange", "Olet", "Perno / empaquetadura"}
+    UNIDAD_TXT = {"m_mm": "m", "m": "m", "m2": "m²", "m3": "m³", "kg": "kg", "un": "un"}
+    DISCIPLINAS = list(PLANTILLAS)
+    
+    # palabras clave del tipo para buscar el ítem en el catálogo
+    _CLAVES_TIPO = {
+        "Cañería": ["PIPE"], "Válvula": ["VALVE"], "Soporte": ["SOPORTE", "SHOE", "GUIA"], "Aislación": ["AISLACION"],
+        "Excavación": ["EXCAVACION"], "Relleno": ["RELLENO"], "Emplantillado": ["EMPLANTILLADO"],
+        "Hormigón": ["HORMIGON", "PEDESTAL", "FUNDACION", "MURO", "LOSA", "RADIER", "CANALETA"], "Mortero / grout": ["MORTERO", "GROUT"], "Moldaje": ["MOLDAJE"],
+        "Geomembrana": ["GEOMEMBRANA"], "Armadura": ["REFUERZO DE HORMIGON", "ARMADURA", "ACERO DE REFUERZO", "FIERRO"],
+        "Pernos / insertos (kg)": ["PERNO", "INSERTO"], "Pernos / insertos (un)": ["PERNO", "INSERTO"],
+        "Prefabricado": ["PREFABRICAD"], "Grating / piso": ["GRATING", "PISO"], "Baranda / escalera": ["BARANDA",
+                                                                                                        "ESCALERA"],
+        "Cable": ["CABLE"], "Escalerilla / bandeja": ["ESCALERILLA", "BANDEJA"], "Conduit": ["CONDUIT"],
+        "Banco de ductos": ["BANCO DE DUCTOS"], "Malla a tierra": ["DESNUDO", "MALLA"],
+        "Soldadura exotérmica": ["EXOTERMICA"], "Luminaria": ["LUMINARIA", "PROYECTOR"], "Tablero / equipo": ["TABLERO"],
+    }
+    _CAPITULO_TIPO = {"Excavación": ("00",), "Relleno": ("00",), "Geomembrana": ("00",), "Emplantillado": ("10",),
+                      "Hormigón": ("10",), "Mortero / grout": ("10",), "Moldaje": ("10",), "Armadura": ("10",),
+                      "Pernos / insertos (kg)": ("10",), "Pernos / insertos (un)": ("10",), "Prefabricado": ("10",),
+                      "Cañería": ("51",), "Válvula": ("52",), "Soporte": ("52",)}
+    _VALVULAS = {"BALL": "BALL", "BUTTERFLY": "BUTTERFLY", "CHECK": "CHECK", "GATE": "GATE", "GLOBE": "GLOBE",
+                 "PLUG": "PLUG", "KNIFE": "KNIFE"}
+    
+    
+    def columnas(disciplina: str) -> list[tuple[str, str, str]]:
+        return PLANTILLAS[disciplina]
+    
+    
+    def fila_vacia(disciplina: str) -> dict:
+        return {n: (None if t == "num" else "") for n, t, _ in PLANTILLAS[disciplina]}
+    
+    
+    # ------------------------------------------------------------------ catálogo EC-002
+    
+    def catalogo_de_planilla(datos: bytes) -> list[dict]:
+        """Todo el itemizado EC-002 de una planilla de avance (o cualquier Excel con la hoja de itemizado)."""
+        wb = CUB._abrir(datos)
+        try:
+            h = CUB._hoja_itemizado(wb)
+            if not h:
+                raise ValueError("el archivo no tiene una hoja de itemizado EC-002.")
+            filas = CUB._leer_itemizado(CUB._filas(wb[h], max_col=80, max_row=3000))
+        finally:
+            wb.close()
+        vistos, out = set(), []
+        for f in filas:
+            if f["item"] in vistos:
+                continue
+            vistos.add(f["item"])
+            out.append({"item": f["item"], "descripcion": f["descripcion"], "unidad": f["unidad"], "rend": f["rend"],
+                        "contrato": f["contrato"], "disciplina": CUB.disciplina_de(f["especialidad"], f["item"])})
+        return out
+    
+    
+    def unir_catalogos(*listas) -> list[dict]:
+        out: dict[str, dict] = {}
+        for ls in listas:
+            for c in ls or []:
+                if c.get("item") and (c["item"] not in out or (not out[c["item"]].get("rend") and c.get("rend"))):
+                    out[c["item"]] = c
+        return sorted(out.values(), key=lambda c: c["item"])
+    
+    
+    _VACIAS = {"PARA", "DE", "DEL", "LA", "LAS", "EL", "LOS", "Y", "CON", "EN", "POR", "A", "AL", "TIPO"}
+    
+    
+    def _tokens(s: str) -> set[str]:
+        out = set()
+        for t in re.split(r"[^A-Z0-9#/.]+", norm(s)):
+            if len(t) < 2 or t in _VACIAS:
+                continue
+            if len(t) > 4 and t.isalpha():
+                t = t[:-2] if t.endswith("ES") and len(t) > 5 else t.rstrip("S")      # plural → singular
+            out.add(t)
+        return out
+    
+    
+    def _medida(s: str) -> str:
+        """Diámetro en pulgadas normalizado: 24" / 24 / 1 1/2" / 1-1/2 → "24", "1 1/2"."""
+        s = norm(s).replace("”", '"').replace("''", '"').replace("-", " ")
+        m = re.search(r"(\d+(?:\s+\d/\d)?|\d/\d)\s*(?:\"|IN\b|PULG)", s) or re.fullmatch(r"\s*(\d+(?:\s+\d/\d)?|\d/\d)\s*",
+                                                                                      s)
+        return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+    
+    
+    def _medida_desc(desc: str) -> str:
+        d = norm(desc).replace("”", '"').replace("½", " 1/2")
+        m = re.search(r"[–-]\s*(\d+(?:\s*\d/\d)?|\d/\d)\s*\"\s*$", d) or re.search(r"(\d+(?:\s+\d/\d)?|\d/\d)\s*\"", d)
+        return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+    
+    
+    def sugerir_item(disciplina: str, fila: dict, catalogo: list[dict], contexto: str = "",
+                     unidad: str = "") -> tuple[str, float]:
+        """(ítem, puntaje) más parecido del catálogo para la fila. Puntaje 0 = sin sugerencia.
+        contexto: descripción del plano (p. ej. «Fundaciones calderas») para elegir entre ítems por ubicación."""
+        tipo = fila.get("Tipo") or ""
+        texto = " ".join(str(fila.get(k) or "") for k in ("Descripción", "Elemento", "Perfil", "Equipo", "TAG / circuito",
+                                                              "TAG", "Marca"))
+        tok_ctx = _tokens(contexto) - _tokens(texto)
+        tok = _tokens(texto)
+        medida = _medida(str(fila.get("NPS") or "")) or _medida(texto)
+        claves = _CLAVES_TIPO.get(tipo, [])
+        candidatos = [c for c in catalogo if c["disciplina"] == disciplina or
+                      (disciplina == "Piping" and c["item"][:2] in ("51", "52", "53"))]
+        mejor, puntaje = "", 0.0
+        for c in candidatos:
+            d = norm(c["descripcion"])
+            p = 0.0
+            if unidad and c.get("unidad") and not _unidad_compatible(unidad, c["unidad"]):
+                continue
+            if tipo in _CAPITULO_TIPO and c["item"][:2] not in _CAPITULO_TIPO[tipo]:
+                continue
+            if claves:
+                if not any(k in d for k in claves):
+                    continue
+                p += 3
+            if tipo == "Válvula":
+                v = next((k for k in _VALVULAS if k in norm(texto)), None)
+                if v:
+                    p += 3 if v in d else -3
+            if medida:
+                md = _medida_desc(c["descripcion"])
+                if md:
+                    p += 4 if md == medida else -4
+            td = _tokens(d)
+            p += min(len(tok & td), 6) * 0.7 + min(len(tok_ctx & td), 4) * 0.8
+            if c.get("rend"):
+                p += 0.2
+            if p > puntaje:
+                mejor, puntaje = c["item"], p
+        return mejor, puntaje
+    
+    
+    # ------------------------------------------------------------------ cálculo
+    
+    @dataclass
+    class FilaCalc:
+        n: int
+        lamina: str
+        tipo: str
+        descripcion: str
+        unidad: str
+        cantidad: float
+        item: str
+        item_sugerido: bool
+        item_desc: str
+        unidad_item: str
+        rend: float
+        hh: float
+        aviso: str
+    
+    
+    def _desc_fila(disciplina: str, f: dict) -> str:
+        claves = {"Piping": ("NPS", "Descripción", "ID / Spool"), "Obras civiles": ("Elemento",),
+                  "Estructura": ("Marca", "Perfil"), "Mecánica": ("TAG", "Equipo"),
+                  "Eléctricos": ("TAG / circuito", "Descripción")}[disciplina]
+        return " · ".join(str(f.get(k)).strip() for k in claves if str(f.get(k) or "").strip())
+    
+    
+    def _unidad_compatible(calc: str, unidad_item: str) -> bool:
+        u = norm(unidad_item).replace("3", "3").replace("²", "2")
+        if not u:
+            return True
+        grupos = {"m": {"M", "ML", "MTS", "MT"}, "m²": {"M2"}, "m³": {"M3"}, "kg": {"KG", "KGS"},
+                  "un": {"UN", "UND", "EA", "C/U", "CU", "U", "UNID", "GL", "LS", "PZA"}}
+        u = u.replace("²", "2").replace("³", "3")
+        return u in grupos.get(calc, set())
+    
+    
+    def cantidad_fila(disciplina: str, f: dict) -> tuple[float, str, str]:
+        """(cantidad, unidad, aviso) de una fila según su tipo."""
+        tipo = f.get("Tipo") or ""
+        modo = TIPOS[disciplina].get(tipo)
+        if not modo:
+            return 0.0, "", "Elige el tipo"
+        cant = _num(f.get("Cantidad"))
+        if cant == 0 and modo in ("m_mm", "m", "m3", "m2", "kg") and disciplina != "Mecánica":
+            cant = 1.0                                    # en largos y volúmenes, la cantidad vacía es 1
+        L, A, H = _num(f.get("Largo (m)")), _num(f.get("Ancho (m)")), _num(f.get("Alto (m)"))
+        if modo == "m_mm":
+            mm = _num(f.get("Largo (mm)"))
+            return cant * mm / 1000, "m", ("" if mm else "Falta el largo (mm)")
+        if modo == "m":
+            return cant * L, "m", ("" if L else "Falta el largo (m)")
+        if modo == "m2":
+            return cant * L * A, "m²", ("" if L and A else "Faltan largo y ancho")
+        if modo == "m3":
+            v = cant * L * A * H - _num(f.get("Descuento (m³)"))
+            return v, "m³", ("" if L and A and H else "Faltan largo, ancho o alto")
+        if modo == "kg":
+            kgcu = _num(f.get("kg c/u"))
+            if kgcu:
+                return cant * kgcu, "kg", ""
+            kgm = _num(f.get("kg/m"))
+            if kgm and L:
+                return cant * L * kgm, "kg", ""
+            return 0.0, "kg", "Falta el peso (kg c/u, o largo × kg/m)"
+        if modo == "kg_o_un":
+            kgcu = _num(f.get("kg c/u"))
+            return (cant * kgcu, "kg", "") if kgcu else (cant, "un", "")
+        return cant, "un", ("" if cant else "Falta la cantidad")
+    
+    
+    def _vacia(f: dict) -> bool:
+        return all(v in (None, "") or (isinstance(v, float) and v != v) for k, v in f.items() if k != "Tipo")
+    
+    
+    def calcular(disciplina: str, filas: list[dict], catalogo: list[dict], contexto: str = "") -> list[FilaCalc]:
+        por_item = {c["item"]: c for c in catalogo}
+        out = []
+        for n, f in enumerate(filas, 1):
+            if _vacia(f):
+                continue
+            cant, unidad, aviso = cantidad_fila(disciplina, f)
+            item = str(f.get("Ítem EC-002") or "").split(" · ")[0].strip()
+            sugerido = False
+            if not item and catalogo and f.get("Tipo") not in SIN_ITEM:
+                item, p = sugerir_item(disciplina, f, catalogo, contexto, unidad)
+                sugerido = bool(item)
+                if p < 5 and item:
+                    aviso = (aviso + "; " if aviso else "") + "ítem sugerido con poca certeza: revísalo"
+            c = por_item.get(item, {})
+            if item and not c and catalogo:
+                aviso = (aviso + "; " if aviso else "") + "ítem no está en el catálogo"
+            rend = float(c.get("rend") or 0)
+            if c and not _unidad_compatible(unidad, c.get("unidad", "")):
+                aviso = (aviso + "; " if aviso else "") + f"el ítem se paga en {c.get('unidad')} y la fila está en {unidad}"
+            out.append(FilaCalc(n, str(f.get("Lámina") or ""), str(f.get("Tipo") or ""), _desc_fila(disciplina, f), unidad,
+                                cant, item, sugerido, c.get("descripcion", ""), c.get("unidad", ""), rend, cant * rend,
+                                aviso))
+        return out
+    
+    
+    def resumen_items(calc: list[FilaCalc]) -> list[dict]:
+        r: dict[tuple, dict] = {}
+        for f in calc:
+            k = (f.item or "(sin ítem)", f.unidad)
+            d = r.setdefault(k, {"Ítem": k[0], "Descripción ítem": f.item_desc, "Unidad": f.unidad, "Cantidad": 0.0,
+                                 "Rend. HH/u": f.rend, "HH": 0.0, "Filas": 0})
+            d["Cantidad"] += f.cantidad
+            d["HH"] += f.hh
+            d["Filas"] += 1
+        return sorted(r.values(), key=lambda d: d["Ítem"])
+    
+    
+    def comparar(nuevo: list[dict], anterior: list[dict]) -> list[dict]:
+        """Por ítem: cantidad de la cubicación anterior vs la nueva."""
+        a = {(d["Ítem"], d["Unidad"]): d for d in anterior}
+        b = {(d["Ítem"], d["Unidad"]): d for d in nuevo}
+        out = []
+        for k in sorted(set(a) | set(b)):
+            ca, cb = a.get(k, {}).get("Cantidad", 0.0), b.get(k, {}).get("Cantidad", 0.0)
+            rend = (b.get(k) or a.get(k))["Rend. HH/u"]
+            out.append({"Ítem": k[0], "Unidad": k[1], "Anterior": ca, "Nueva": cb, "Diferencia": cb - ca,
+                        "Diferencia HH": (cb - ca) * rend})
+        return out
+    
+    
+    # ------------------------------------------------------------------ datos del plano
+    
+    _RE_PLANO = re.compile(r"[A-Z0-9]{3,}(?:-[A-Z0-9]{1,6}){3,}")
+    
+    
+    def meta_de_nombre(nombre: str) -> dict:
+        base = re.sub(r"\.pdf$", "", nombre or "", flags=re.I)
+        b = norm(base).replace(" ", "")
+        m = _RE_PLANO.search(b)
+        plano = m.group(0) if m else norm(base)[:60]
+        plano = re.sub(r"[-_]?REV.*$", "", plano)
+        rev = re.search(r"REV\.?\s*([A-Z0-9]{1,3})", norm(base))
+        area = re.search(r"-(\d{4})-", plano)
+        disc = ""
+        for clave, d in (("-PIP-", "Piping"), ("-CIV-", "Obras civiles"), ("-STR-", "Estructura"), ("-EST-", "Estructura"),
+                         ("-MEC-", "Mecánica"), ("-ELE-", "Eléctricos"), ("-ELC-", "Eléctricos"), ("-EL-", "Eléctricos"),
+                         ("-INS-", "Eléctricos")):
+            if clave in plano + "-":
+                disc = d
+                break
+        return {"plano": plano, "rev": rev.group(1) if rev else "", "area": area.group(1) if area else "",
+                "disciplina": disc}
+    
+    
+    def paginas_pdf(datos: bytes) -> int:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(datos)) as pdf:
+            return len(pdf.pages)
+    
+    
+    def imagen_pagina(datos: bytes, pagina: int, dpi: int = 110) -> bytes:
+        """PNG de una página del plano (para verlo al lado de la planilla)."""
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(datos)) as pdf:
+            im = pdf.pages[pagina].to_image(resolution=dpi).original
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            return buf.getvalue()
+    
+    
+    # ------------------------------------------------------------------ Excel
+    
+    def excel(meta: dict, disciplina: str, filas: list[dict], calc: list[FilaCalc],
+              comparacion: list[dict] | None = None) -> bytes:
+        """Cubicación del plano: resumen por ítem (con fórmulas de HH), filas calculadas y lo digitado."""
+        import openpyxl
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        F, FB = Font(name="Arial", size=10), Font(name="Arial", size=10, bold=True)
+        FH, FILL = Font(name="Arial", size=10, bold=True, color="FFFFFF"), PatternFill("solid", fgColor="06205C")
+        AZUL = Font(name="Arial", size=10, color="0000FF")
+        wb = openpyxl.Workbook()
+    
+        def cab(ws, fila, cols, anchos):
+            for j, c in enumerate(cols, 1):
+                x = ws.cell(fila, j, c)
+                x.font, x.fill = FH, FILL
+                x.alignment = Alignment(wrap_text=True, vertical="center")
+            for j, w in enumerate(anchos, 1):
+                ws.column_dimensions[get_column_letter(j)].width = w
+    
+        # Resumen
+        ws = wb.active
+        ws.title = "Resumen"
+        ws["A1"] = f"Cubicación {disciplina} · {meta.get('plano', '')} Rev. {meta.get('rev', '')}"
+        ws["A1"].font = Font(name="Arial", size=13, bold=True, color="06205C")
+        datos_meta = [("N° plano", meta.get("plano", "")), ("Revisión", meta.get("rev", "")), ("Área", meta.get("area", "")),
+                      ("Descripción / línea", meta.get("descripcion", "")), ("Disciplina", disciplina),
+                      ("Cubicó", meta.get("usuario", "")), ("Fecha", meta.get("fecha", ""))]
+        for i, (k, v) in enumerate(datos_meta, 3):
+            ws.cell(i, 1, k).font = FB
+            ws.cell(i, 2, v).font = F
+        f0 = 3 + len(datos_meta) + 1
+        cab(ws, f0, ["Ítem EC-002", "Descripción ítem", "Unidad", "Cantidad", "Rend. HH/u", "HH", "Filas"],
+            [18, 50, 8, 13, 11, 12, 7])
+        res = resumen_items(calc)
+        for i, d in enumerate(res, f0 + 1):
+            ws.cell(i, 1, d["Ítem"]).font = F
+            ws.cell(i, 2, d["Descripción ítem"]).font = F
+            ws.cell(i, 3, d["Unidad"]).font = F
+            ws.cell(i, 4, f"=SUMIFS(Filas!$F:$F,Filas!$G:$G,A{i},Filas!$E:$E,C{i})").number_format = "#,##0.000"
+            x = ws.cell(i, 5, d["Rend. HH/u"])
+            x.number_format, x.font = "0.0000", AZUL
+            ws.cell(i, 6, f"=D{i}*E{i}").number_format = "#,##0.0"
+            ws.cell(i, 7, f"=COUNTIFS(Filas!$G:$G,A{i},Filas!$E:$E,C{i})")
+        fin = f0 + 1 + len(res)
+        ws.cell(fin, 1, "TOTAL HH").font = FB
+        x = ws.cell(fin, 6, f"=SUM(F{f0 + 1}:F{fin - 1})")
+        x.font, x.number_format = FB, "#,##0.0"
+        ws.cell(fin + 2, 1, "Rendimiento (azul): itemizado EC-002 del contrato. Cantidad y HH se recalculan desde la hoja "
+                            "«Filas».").font = Font(name="Arial", size=9, italic=True)
+    
+        # Filas calculadas
+        wf = wb.create_sheet("Filas")
+        cab(wf, 1, ["N°", "Lámina", "Tipo", "Descripción", "Unidad", "Cantidad", "Ítem EC-002", "Ítem sugerido",
+                    "Rend. HH/u", "HH", "Aviso"], [5, 10, 18, 50, 7, 12, 18, 10, 10, 10, 45])
+        for i, c in enumerate(calc, 2):
+            for j, v in enumerate([c.n, c.lamina, c.tipo, c.descripcion, c.unidad, round(c.cantidad, 6), c.item,
+                                   "sí" if c.item_sugerido else "", c.rend, f"=F{i}*I{i}", c.aviso], 1):
+                x = wf.cell(i, j, v)
+                x.font = F
+            wf.cell(i, 6).number_format = "#,##0.000"
+            wf.cell(i, 10).number_format = "#,##0.0"
+        wf.freeze_panes = "A2"
+    
+        # Lo digitado
+        wd = wb.create_sheet("Digitado")
+        cols = [n for n, _, _ in PLANTILLAS[disciplina]]
+        cab(wd, 1, cols, [max(9, min(40, len(c) + 4)) for c in cols])
+        for i, f in enumerate([f for f in filas if not _vacia(f)], 2):
+            for j, c in enumerate(cols, 1):
+                v = f.get(c)
+                if isinstance(v, float) and v != v:
+                    v = None
+                wd.cell(i, j, v).font = F
+        wd.freeze_panes = "A2"
+    
+        if comparacion:
+            wc = wb.create_sheet("Comparación")
+            cab(wc, 1, ["Ítem", "Unidad", "Anterior", "Nueva", "Diferencia", "Diferencia HH"], [18, 8, 12, 12, 12, 13])
+            for i, d in enumerate(comparacion, 2):
+                for j, k in enumerate(["Ítem", "Unidad", "Anterior", "Nueva"], 1):
+                    wc.cell(i, j, d[k]).font = F
+                wc.cell(i, 5, f"=D{i}-C{i}").number_format = "#,##0.000;[Red]-#,##0.000"
+                wc.cell(i, 6, round(d["Diferencia HH"], 2)).number_format = "#,##0.0;[Red]-#,##0.0"
+                for j in (3, 4):
+                    wc.cell(i, j).number_format = "#,##0.000"
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    return SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
+
+
+cubicar_plano = _modulo_cubicar_plano()
+
+# ======================================================================
+# MÓDULO: lector_planos
+# ======================================================================
+def _modulo_lector_planos():
+    import base64
+    import io
+    import json
+    import re
+    import zlib
+    from dataclasses import dataclass, field
+    
+    import numpy as np
+    
+    _PLANTILLAS_B64 = "eNrtmkmvZTsNhf9LMXggnVvs9MmQHkQj+kalGiIYMeL/i7PX59g59xXjYsDgbvnsJnEce3nZuZ8+ffjhh0d6fLo+ljoe18c62vPaSn1e+7pv5Pu6en5eU+6P9PF6SvffTNWkdmWT0v1yej54e/6+5v19uq9Xrhr2ecnzfqek7LNdSJ8/Pz59+IVpc8UImm+WPYN/kvswqbT9Xt0PW90q9bI/Hbm56vvTZVM8l6X5f/Xl+ZN/mn2ustKezJ92fzr86dLar+eTZDZKJpXnk2R6T1fhMhXy0/KhRL+nSD2/Tn4VrVDyuN+bbck0ewosvPL9TLqN1O9P7i+qbt6WyLVLCSl6X2JuqfTTD4+MVY7t72HXvg2hvWVBe/nF3SSNbXXNcc1jffk5hv8oz6H9R3vdCXMZLcjk1kKWnyCnlEIuK+TeQ17V5ZzDJXMMmUfERbna4au/dl8Jq/TDUW5BgZS0TUkuWbWFWeaZOcl7l8u1T3+nje7far80oqS+xe0zP3i/QbIJbo4dCANbeyyXIGKNGK8QL8hz+ju11v1pXctHbMdM7nXMKFWTvjB5upjlFSbXFfKM++V4vwg7TJ5xv2oVJsuXTV52X+b5o5snfKme0bVG/Ej1cMXbQcJJ6+GX+RmB4bHHW7d6AX/lGLnOw5nb+U0+PT732AFkQA/ZdkwywIdc4xXAD5ldQgYAkdkx5OXTbn/6yYdH+X/AHwH/OGzxtLRJjuSp7MyYZjYp57GlUTbip50FSnfsv5ZngT1y8534/Regd0xPc5EC9y2s3w/r5nl4ah3Fnu80nzFPliFltpza++QcboY8h/Je9lQuTUoBBthTQKArJLpSjwbQLg2itAg8Lu1VV/oaFie3V4oz6OFq2fTddvmDgS9ruO3/nEYp8Lq6hcybOZ/mlZaXJizpcIWaXEEmEYfpI+mGYHpomfcbS98kabnm9vPZunT67RcSwpg7ZTePn+I0JeVhfvS2g2dLINi1go8VGaQWcre2TpZuzmaekhT58ZcUqR6qa0u5YrC8J82t+Px6P8lgTRSmjOpyzxhPm2bZKflse5N+Z86b857xEnqlvpzHoIGShEx8Tdm854AkuZ3ML3M1Od9gnzCGUG8sX1JVurjqfJyTQ3GnJivKtLOw+yt8T7PPsPRKjm6rACTZGXFdws/JNsg7ExumCNZgjajWwu+c/pRXkXn+5rFtfxAwrSZdGIqrp3/yZjFQh2APB6p2BWj1q7o8RCKQp8g68rqSyQZK13ZMYwG1eCRfs3vuTTJpTQRacXaQEwZC3eW+VjRn0+7h/NAGRmsKEazd00GwfvMlN06OSl4SEE5CmiQYy+6thUpGCQtyNQXvRNRsEV0tbufZjgQtVX604UZ+mAspQr6rOyW1d9oc/rcRoLp5m8Ka52NM/0zwco+1vX56AcHMo+M6yU1zA1kzENmFCg5zQfm0b5esgUyRxnaClZMMkFxuWiBybzHM6PEtQXLLO9y7KVUbK6qW+8y7BwrKx4XqZbyyZsJTmuYWpZF2qrs5uhIIqaYC7XKvGiVfX9Ln4zaSdnUpoi7txmJCBTV+pAhZ2E0Rtdhd3V7d8v6O9UsvLtYGNJGKhQpLcc/uWvW3NZBedZfc0ytBgd4QsCG3UVwmuU3oNDE0raSElO5rwigAXhEDTiQsrGJUa8u41LZWfrEWJSHVB6vKM3IDDpc9TUHbK0V9hx5rbCkhew6oopxiMXjx5ZeN82eK/2YrNERmyPG3Ve8f2ifuy58vmg6pbdy6f8CTOl/IcnssCCk/LiHVpkwEMmw207tYnrguvE3qtRdvV/YsnuaUIyCqXC0OYJUk7wlAQX6WFQvefFHMC6MqBcb2vSSt1ujRh5E+5TCX6TOqM7jNzi1ianPmBl8nBxoP0juNpkGhchDI9+q8bG9YEqtcntC3NmcXY6f+7FUweadXjzwDxEIpDOAQbqKiCl2ik2bTOJE7o7R7HakEImHzS6e/HKB5mWdsNfCuoTXnq0ZVREMMe+G2pCs4JDL8Q09bc9LQBahDWa+v7ME3IIJS6a/vKQAsje7OGj5F0uA4EcQVtYn7iovpq62qEyqSLGrgYTPNg2WvCLvH/4oiss207bIM5jCa5Z4Ub1Biqpma3V+pbgNWgEr426VveiOTQV6mJ5pS6cMkR3mbXiq9HR4Eel5nr0ZZxeQ5XD5u72KpB58ePUIfeQU4t2P4fvCATqAOCo+fe7n+duygdyCT1yCRjS34fM8u37ErqLhv1+WbdflWnazMasUaRTc+Y0V3/S8FeD0qyhXFe4lX8BnkWmJIfObsVodsNuA2VrAqcebgeLKEFVaALcOcwFKPZniJihmbGIVM0+Vvu/CfXtrJexOit5G6M6DqCWcKsuhaQDEKtGJ4TsgxqXkFyqejrH/pMr0jjapBZB1FiE0ornMwv3UyvLVczoZ9t+wcMz3DKG43D530rKW7y7TFkTcd+uYlcRk6iicMsoKmG5OcL/THUUs0tEnPg7TNOCvI2SzRQ5+MU6knFRiKz2W99b11P9uMHzqD70HymndwOZug4VQ8rzkNaFAD/R4wcLnXalAxb/eIJk1KRM0H6Ybz9QRBW1sjzZH8FKA12VdjUhvDYIkdLEnazU6Rqdyp4zQeyDNp7Ho1YGQ8Z+995aPf8Z0Pj7rRcNBfEQKYvIbLIIDJQgBkEMBkLQa5xCuWNaCWJYYEAZDb8f6t4pujtpE6+HJktCTOA88o09sBnK+06yh+SHewc75RlFBmNnX4jB3fZDZ7OW1OQM+/ZJ8Z2dqTyECcZHMzZCBOMmWsyTPGtGYQ8ogx4W4mW4LRmCOFcfJqYZySwjqFkgLkGW4d87aLwqu6dSpxSAkAUkEXAQ5suq0DOj6tIw8aO8W3nakzTQo4ReuOtgU4W14PAdTVKOxyemogDyrUyK0afPlBZe0n2ZEyv/Qs+nWS6EG7erCuCJ80PXpyUK7ioUOfBk/JcVBSZwqCAbuZNIgiM/aD6dQcrcV68BdhRaY4pSxNccBQhDKwErBkyCuqts08U+Tecr7QhebmRc083+XO75+5c4dzDo+1M1lLKGN7bI7unpEtOSxkqx8OYQ6rvIbD3mRrO2zX2Wy2RYXHfnfXNb2EXncP7M2bm1f1dhQtDXz6oi3evB/sZ8Z6KOCkM0snSFnlUgiRhwe5d3hjdOv0vS9Yah0KeX27O3QolCHoLQ6Los3feaG6UpBu06qFVtccrtV16HR2E5L1gpI1WayZcDvA3N2EtayZkDYpT7dc0HqJU3AUdjMKsly9h54MrV4C40H7kXGopyyl/vy+AGxRxHF6ZMWgFRRxSkQEczRE5NIhNfmsbGpQR+t+Qi+PuagupNLjhfwswp8akkXKMxcnaZTBJHFFE+jUKW5WNKPAKprNYE/XIZO1JW77JBodRRan8Szbk9r/fliqW8NwukyEIxthBodb4FAa0d6wKm2+eLzwZBYKBFoa8kfY2ByP3VrZdONfR61sZx49Dq0SjIjT0RwUySpBtmlEzZhIZslr+e7ScGm6tEwKuGb81/8EqRHdqfgZXfWE4DG/PDW08a1/SpnDk0RZL6T0H2YCDGMlUsAbJ+koxtESqQ8oHn7S0sAZzgYgJ3qFkxy+JEzrPpvUQDQ5fVdcZkZTqsb91uN+H/HtoHVIUX6N+AcYeIMOWGnIcDhqSCUaSq7PSVgDl7vfIMD/fbiI7Q9HVyU6siaP8JFLa92jHSYkwSJDhJBJtyX5WanJJb61A/qtoZV/cjra1RLpNIE8tOKTJ00cNCX/fwo6d8kPQVKi1dGd3y9oLTBhDf44Sv7ny39BfAWC8zWD9vPnz/8BfmWJDQ=="
+    _UMBRAL = 0.08          # distancia máxima para aceptar una letra
+    _ESPACIO = 0.75         # separación (en alturas de letra) que se considera espacio
+    
+    
+    def _plantillas():
+        datos = json.loads(zlib.decompress(base64.b64decode(_PLANTILLAS_B64)))
+        out: dict[int, list] = {}
+        for ch, n, flat in datos:
+            out.setdefault(n, []).append((ch, np.array(flat, float).reshape(-1, 2)))
+        return out
+    
+    
+    _CACHE: dict = {}
+    
+    
+    # ------------------------------------------------------------------ geometría
+    
+    class _Pagina:
+        def __init__(self, pg):
+            self.pg = pg
+            tr = [np.array(c["pts"], float) for c in pg.curves if c.get("pts")]
+            tr += [np.array([(l["x0"], l["top"]), (l["x1"], l["bottom"])], float) for l in pg.lines]
+            self.tr = tr
+            self.bb = (np.array([(t[:, 0].min(), t[:, 1].min(), t[:, 0].max(), t[:, 1].max()) for t in tr])
+                       if tr else np.zeros((0, 4)))
+            self.chars = pg.chars
+    
+        def trazos(self, a, ya, b, yb, m=0.3):
+            bb = self.bb
+            if not len(bb):
+                return []
+            k = (bb[:, 0] >= a + m) & (bb[:, 2] <= b - m) & (bb[:, 1] >= ya + m) & (bb[:, 3] <= yb - m)
+            return [self.tr[i] for i in np.where(k)[0]]
+    
+        def texto_real(self, a, ya, b, yb) -> str | None:
+            cs = [c for c in self.chars if c["x0"] >= a and c["x1"] <= b and c["top"] >= ya and c["bottom"] <= yb]
+            if not cs:
+                return None
+            cs.sort(key=lambda c: (round(c["top"] / 3), c["x0"]))
+            return re.sub(r"\s+", " ", "".join(c["text"] for c in cs)).strip()
+    
+    
+    def _segmentos(pg):
+        segs = [(l["x0"], l["top"], l["x1"], l["bottom"]) for l in pg.lines]
+        for r in pg.rects:
+            x0, t, x1, b = r["x0"], r["top"], r["x1"], r["bottom"]
+            segs += [(x0, t, x1, t), (x0, b, x1, b), (x0, t, x0, b), (x1, t, x1, b)]
+        for c in pg.curves:
+            pts = c.get("pts") or []
+            for (a, b_), (c_, d) in zip(pts, pts[1:]):
+                segs.append((min(a, c_), min(b_, d), max(a, c_), max(b_, d)))
+        H = [s for s in segs if abs(s[3] - s[1]) < 0.6 and s[2] - s[0] > 20]
+        V = [s for s in segs if abs(s[2] - s[0]) < 0.6 and s[3] - s[1] > 6]
+        return H, V
+    
+    
+    def _tablas(H, V):
+        """Tablas = grupos de líneas horizontales con el mismo ancho; filas entre líneas; celdas por verticales completas."""
+        grupos: dict = {}
+        for x0, y, x1, _ in H:
+            grupos.setdefault((round(x0), round(x1)), []).append(y)
+        bloques = []
+        for (x0, x1), ys in grupos.items():
+            u = []
+            for y in sorted(ys):
+                if not u or y - u[-1] > 1.0:
+                    u.append(y)
+            b = [u[0]]
+            for y in u[1:]:
+                if y - b[-1] > 70:
+                    if len(b) >= 3:
+                        bloques.append((x0, x1, b))
+                    b = [y]
+                else:
+                    b.append(y)
+            if len(b) >= 3:
+                bloques.append((x0, x1, b))
+        out = []
+        for x0, x1, ys in bloques:
+            filas = []
+            for ya, yb in zip(ys, ys[1:]):
+                xs = sorted({round(s[0], 1) for s in V if x0 - 1 <= s[0] <= x1 + 1 and s[1] <= ya + 1.2 and s[3] >= yb - 1.2})
+                xs = [x for i, x in enumerate(xs) if i == 0 or x - xs[i - 1] > 2]
+                if not xs or xs[0] > x0 + 2:
+                    xs = [x0] + xs
+                if xs[-1] < x1 - 2:
+                    xs = xs + [x1]
+                filas.append((ya, yb, [(a, b) for a, b in zip(xs, xs[1:]) if b - a > 3]))
+            out.append((x0, x1, filas))
+        return out
+    
+    
+    def _lineas(trs, h: float | None = None):
+        if not trs:
+            return []
+        hs = [t[:, 1].max() - t[:, 1].min() for t in trs]
+        grandes = [x for x in hs if x > 2.0]
+        if h:
+            hm = h                                  # altura de letra de la tabla
+        else:
+            tope = max(grandes) if grandes else 0
+            hm = float(np.median([x for x in grandes if x > 0.45 * tope])) if grandes else 0
+        altos = sorted([(t[:, 1].min(), t[:, 1].max()) for t, x in zip(trs, hs) if 0.6 * hm <= x <= 1.12 * hm and x > 2.0])
+        bandas = []
+        for y0, y1 in altos:
+            if bandas and y0 < bandas[-1][1] - 0.5:
+                bandas[-1][1] = max(bandas[-1][1], y1)
+            else:
+                bandas.append([y0, y1])
+        if not bandas:
+            bandas = [[min(t[:, 1].min() for t in trs), max(t[:, 1].max() for t in trs)]]
+        L = [{"y0": b[0], "y1": b[1], "t": []} for b in bandas]
+        for t in trs:
+            yc = (t[:, 1].min() + t[:, 1].max()) / 2
+    
+            def dist(l):
+                h = l["y1"] - l["y0"]
+                return 0 if l["y0"] - 0.3 * h <= yc <= l["y1"] + 0.3 * h else min(abs(yc - l["y0"]), abs(yc - l["y1"])) + 100
+            min(L, key=dist)["t"].append(t)
+        out = []
+        for l in L:
+            g = []
+            for t in sorted(l["t"], key=lambda t: t[:, 0].min()):
+                x0, x1 = t[:, 0].min(), t[:, 0].max()
+                xc = (x0 + x1) / 2
+                if g:
+                    G = g[-1]
+                    gc = (G["x0"] + G["x1"]) / 2
+                    solape = min(x1, G["x1"]) - max(x0, G["x0"])
+                    if (G["x0"] - 0.05 <= xc <= G["x1"] + 0.05 or x0 - 0.05 <= gc <= x1 + 0.05
+                            or solape > 0.3 * max(0.01, min(x1 - x0, G["x1"] - G["x0"])) or x0 <= G["x1"] + 0.25):
+                        G["t"].append(t)
+                        G["x0"], G["x1"] = min(G["x0"], x0), max(G["x1"], x1)
+                        continue
+                g.append({"x0": x0, "x1": x1, "t": [t]})
+            if g:
+                out.append({"y0": l["y0"], "y1": l["y1"], "g": g})
+        return out
+    
+    
+    def _remuestrear(t, n=12):
+        d = np.sqrt(((t[1:] - t[:-1]) ** 2).sum(1))
+        s = np.concatenate([[0], np.cumsum(d)])
+        if s[-1] == 0:
+            return np.repeat(t[:1], n, 0)
+        u = np.linspace(0, s[-1], n)
+        return np.stack([np.interp(u, s, t[:, 0]), np.interp(u, s, t[:, 1])], 1)
+    
+    
+    def _rasgo(g, top, h):
+        ts = sorted(g["t"], key=lambda t: (round(t[:, 0].min(), 1), t[:, 1].min()))
+        P = np.concatenate([_remuestrear(t) for t in ts])
+        return len(ts), np.stack([(P[:, 0] - g["x0"]) / h, (P[:, 1] - top) / h], 1)
+    
+    
+    def _nube(P, n):
+        """Puntos del glifo repartidos según el largo de cada trazo (para comparar sin importar el orden del trazo)."""
+        out = []
+        for b in np.split(P, n):
+            largo = float(np.sqrt(((b[1:] - b[:-1]) ** 2).sum(1)).sum())
+            k = max(2, int(round(largo * 14)))
+            out.append(_remuestrear(b, k))
+        return np.concatenate(out)
+    
+    
+    def _chamfer(A, B):
+        D = np.sqrt(((A[:, None, :] - B[None, :, :]) ** 2).sum(2))
+        return float((D.min(1).mean() + D.min(0).mean()) / 2)
+    
+    
+    def _clasificar(n, P):
+        if "pl" not in _CACHE:
+            _CACHE["pl"] = _plantillas()
+        PL = _CACHE["pl"]
+        mejor = (9.0, "?")
+        # el mismo trazo puede venir dibujado en sentido contrario: se prueba también invertido
+        Pr = np.concatenate([b[::-1] for b in np.split(P, n)]) if n else P
+        for ch, Q in PL.get(n, []):
+            if Q.shape == P.shape:
+                d = min(float(np.sqrt(((Q - P) ** 2).sum(1)).mean()), float(np.sqrt(((Q - Pr) ** 2).sum(1)).mean()))
+                if d < mejor[0]:
+                    mejor = (d, ch)
+        if mejor[0] > _UMBRAL:
+            # trazo dibujado en otro orden o con otra cantidad de polilíneas: comparación por forma
+            A = _nube(P, n)
+            for m, lista in PL.items():
+                for ch, Q in lista:
+                    d = _chamfer(A, _nube(Q, m)) * 1.4
+                    if d < mejor[0]:
+                        mejor = (d, ch)
+        return mejor
+    
+    
+    def _cero_o(s: str) -> str:
+        """En la fuente, 0 y O son iguales: es O en palabras sin otros dígitos (OLETS, BORE), 0 en lo demás."""
+        def tok(m):
+            t = m.group(0)
+            otros = re.sub(r"0", "", t)
+            return t if any(ch.isdigit() for ch in otros) or not any(ch.isalpha() for ch in otros) else t.replace("0", "O")
+        return re.sub(r"[^\s]+", tok, s)
+    
+    
+    def _texto_celda(pag: _Pagina, a, ya, b, yb, h) -> tuple[str, float]:
+        real = pag.texto_real(a, ya, b, yb)
+        if real is not None:
+            return real, 0.0
+        partes, peor = [], 0.0
+        for l in _lineas(pag.trazos(a, ya, b, yb), h):
+            s, prev = "", None
+            for g in l["g"]:
+                n, P = _rasgo(g, l["y1"] - h, h)
+                d, ch = _clasificar(n, P)
+                if d > _UMBRAL:
+                    ch = "?"
+                peor = max(peor, d)
+                if prev is not None and g["x0"] - prev > _ESPACIO * h:
+                    s += " "
+                s += ch
+                prev = g["x1"]
+            partes.append(s.replace("''", '"'))
+        return _cero_o(" ".join(p for p in partes if p)), peor
+    
+    
+    def _altura(pag, filas) -> float:
+        hs = []
+        for ya, yb, celdas in filas:
+            for a, b in celdas:
+                for l in _lineas(pag.trazos(a, ya, b, yb)):
+                    if len(l["g"]) >= 2:
+                        hs.append(l["y1"] - l["y0"])
+        return float(np.median(hs)) if hs else 7.0
+    
+    
+    # ------------------------------------------------------------------ isométrico
+    
+    SECCIONES = {"PIPE": "Cañería", "FITTINGS": "Fitting", "OLETS": "Olet", "FLANGES": "Flange",
+                 "FASTENERS": "Perno / empaquetadura", "VALVES": "Válvula", "PIPE SUPPORTS": "Soporte",
+                 "SUPPORTS": "Soporte", "CUT PIPE LENGHTS": "CORTES", "CUT PIPE LENGTHS": "CORTES",
+                 "CUT LENGTHS": "CORTES", "GASKETS": "Perno / empaquetadura", "BOLTS": "Perno / empaquetadura"}
+    
+    
+    _BOM = ["ID", "QTY", "ND", "ITEM CODE", "DESCRIPTION", "SPEC"]
+    _CABECERAS = {"CORTES": {3: ["ID", "ND", "LENGTH"]}, "Soporte": {6: ["ID", "QTY", "ND", "SUP 1", "SUP 2", "SUP 3"]},
+                  **{k: {6: _BOM, 5: ["ID", "QTY", "ND", "ITEM CODE", "DESCRIPTION"]}
+                     for k in ("Cañería", "Fitting", "Olet", "Flange", "Perno / empaquetadura", "Válvula")}}
+    
+    
+    @dataclass
+    class FilaLeida:
+        lamina: int
+        seccion: str
+        datos: dict
+        dudosa: bool = False
+    
+    
+    @dataclass
+    class Lectura:
+        paginas: int = 0
+        filas: list[FilaLeida] = field(default_factory=list)
+        avisos: list[str] = field(default_factory=list)
+        tablas: int = 0
+        glifos_dudosos: int = 0
+    
+    
+    def _num(s) -> float:
+        s = str(s or "").upper().replace(",", ".")
+        m = re.search(r"\d+(\.\d+)?", s.replace(" ", ""))
+        return float(m.group(0)) if m else 0.0
+    
+    
+    def _nd(s: str) -> str:
+        s = (s or "").replace(" ", "")
+        return s if s.endswith('"') or "X" in s or not s else s + '"'
+    
+    
+    def leer_isometrico(datos: bytes, progreso=None) -> Lectura:
+        import pdfplumber
+        lec = Lectura()
+        with pdfplumber.open(io.BytesIO(datos)) as pdf:
+            lec.paginas = len(pdf.pages)
+            for ip, pg in enumerate(pdf.pages):
+                if progreso:
+                    progreso(ip, lec.paginas)
+                pag = _Pagina(pg)
+                H, V = _segmentos(pg)
+                for x0, x1, filas in _tablas(H, V):
+                    if x1 - x0 > 900:
+                        continue
+                    h = _altura(pag, filas)
+                    seccion, cab = None, None
+                    for ya, yb, celdas in filas:
+                        if len(celdas) == 1:
+                            t, _ = _texto_celda(pag, *celdas[0][:1], ya, celdas[0][1], yb, h) if False else                             _texto_celda(pag, celdas[0][0], ya, celdas[0][1], yb, h)
+                            clave = re.sub(r"[^A-Z ]", "", t.upper()).strip()
+                            clave = re.sub(r"\s+", " ", clave)
+                            if clave in SECCIONES:
+                                seccion, cab = SECCIONES[clave], None
+                                lec.tablas += 1
+                            elif clave.startswith("CUT PIPE") or clave.startswith("CUT LENG"):
+                                seccion, cab = "CORTES", None
+                            continue
+                        if seccion is None:
+                            continue
+                        textos = [_texto_celda(pag, a, ya, b, yb, h) for a, b in celdas]
+                        nombres = [re.sub(r"[^A-Z0-9 ]", "", t.upper()).strip() for t, _ in textos]
+                        if nombres and nombres[0] == "ID":
+                            canon = _CABECERAS.get(seccion, {}).get(len(nombres))
+                            cab = (canon or nombres, celdas)
+                            continue
+                        if cab is None:
+                            continue
+                        # datos con los límites de la cabecera (una línea del dibujo puede cortar una celda)
+                        if len(celdas) != len(cab[1]):
+                            textos = [_texto_celda(pag, a, ya, b, yb, h) for a, b in cab[1]]
+                        if not any(t for t, _ in textos):
+                            continue
+                        d = {n: t for n, (t, _) in zip(cab[0], textos)}
+                        utiles = [(t, x) for n, (t, x) in zip(cab[0], textos) if n != "SPEC"]
+                        dudosa = any(x > _UMBRAL or "?" in t for t, x in utiles)
+                        lec.glifos_dudosos += sum(t.count("?") for t, _ in utiles)
+                        lec.filas.append(FilaLeida(ip + 1, seccion, d, dudosa))
+        _validar(lec)
+        return lec
+    
+    
+    def _validar(lec: Lectura):
+        """Los cortes de cada diámetro deben sumar lo que dice el BOM (el BOM redondea hacia arriba a 0,1 m)."""
+        for lam in sorted({f.lamina for f in lec.filas}):
+            cortes, bom = {}, {}
+            for f in lec.filas:
+                if f.lamina != lam:
+                    continue
+                if f.seccion == "CORTES":
+                    nd = _nd(f.datos.get("ND", ""))
+                    cortes[nd] = cortes.get(nd, 0) + _num(f.datos.get("LENGTH") or f.datos.get("LENGHT")) / 1000
+                elif f.seccion == "Cañería":
+                    nd = _nd(f.datos.get("ND", ""))
+                    bom[nd] = bom.get(nd, 0) + _num(f.datos.get("QTY"))
+            for nd in sorted(set(cortes) | set(bom)):
+                c, b = cortes.get(nd, 0), bom.get(nd, 0)
+                if b and not (-0.005 <= b - c <= 0.15):
+                    lec.avisos.append(f"Lámina {lam}, {nd}: los cortes suman {c:.3f} m y el BOM dice {b:.1f} m. "
+                                      f"Revisa los largos de esa lámina.")
+                elif c and not b:
+                    lec.avisos.append(f"Lámina {lam}, {nd}: hay cortes ({c:.3f} m) pero el BOM no trae cañería de ese "
+                                      f"diámetro.")
+    
+    
+    def a_planilla(lec: Lectura, peso_soporte: float | None = None) -> list[dict]:
+        """Filas para la planilla de cubicación de piping."""
+        out = []
+        n_pag = lec.paginas
+        desc_pipe = {}
+        for f in lec.filas:
+            if f.seccion == "Cañería":
+                desc_pipe[(f.lamina, _nd(f.datos.get("ND", "")))] = f.datos.get("DESCRIPTION", "")
+        for f in lec.filas:
+            d = f.datos
+            lam = f"{f.lamina} DE {n_pag}"
+            obs = "revisar lectura" if f.dudosa else ""
+            if f.seccion == "CORTES":
+                nd = _nd(d.get("ND", ""))
+                out.append({"Lámina": lam, "Tipo": "Cañería", "NPS": nd,
+                            "Descripción": desc_pipe.get((f.lamina, nd), "PIPE"), "ID / Spool": d.get("ID", ""),
+                            "Cantidad": 1.0, "Largo (mm)": _num(d.get("LENGTH") or d.get("LENGHT")), "kg c/u": None,
+                            "Ítem EC-002": "", "Observación": obs})
+            elif f.seccion == "Cañería":
+                continue                                       # la cañería se cubica por cortes
+            elif f.seccion == "Soporte":
+                sup = " + ".join(x for x in (d.get("SUP 1", ""), d.get("SUP 2", ""), d.get("SUP 3", "")) if x)
+                out.append({"Lámina": lam, "Tipo": "Soporte", "NPS": _nd(d.get("ND", "")), "Descripción": sup,
+                            "ID / Spool": d.get("ID", ""), "Cantidad": _num(d.get("QTY")), "Largo (mm)": None,
+                            "kg c/u": peso_soporte or None, "Ítem EC-002": "", "Observación": obs})
+            else:
+                out.append({"Lámina": lam, "Tipo": f.seccion, "NPS": _nd(d.get("ND", "")),
+                            "Descripción": d.get("DESCRIPTION", ""),
+                            "ID / Spool": (d.get("ITEM CODE") or "").replace(" ", ""),
+                            "Cantidad": _num(d.get("QTY")), "Largo (mm)": None, "kg c/u": None, "Ítem EC-002": "",
+                            "Observación": obs})
+        return out
+
+    return SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
+
+
+lector_planos = _modulo_lector_planos()
+
+# ======================================================================
+# MÓDULO: semanal
+# ======================================================================
+def _modulo_semanal():
+    import io
+    import re
+    import unicodedata
+    from collections import defaultdict
+    from dataclasses import dataclass, field
+    from datetime import date, datetime, timedelta
+    
+    CUB = cubicacion
+    X = xlsx_xml
+    
+    HOJA_RESUMEN = "1.- Resumen Ejecutivo"
+    HOJA_PORTADA = "0.Portada"
+    HOJA_SEGURIDAD = "2. Seguridad "
+    HOJA_CURVA = "3.Curva de Avance"
+    HOJA_DOTACION = "4.0 Dotación"
+    HOJA_CURVA_DOT = "5. Curva Dotación"
+    HORAS_DIA = 11
+    COLS_REV = ["D", "E", "F", "G", "H", "I"]          # Rev, Fecha, Aprobó, Revisó, Preparó, Emitido para
+    
+    
+    def norm(s) -> str:
+        s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().upper()
+        return re.sub(r"\s+", " ", s).strip()
+    
+    
+    def _hoja(L: X.Libro, nombre: str) -> str | None:
+        """Nombre real de la hoja (tolera espacios y mayúsculas distintas)."""
+        if nombre in L.hojas:
+            return nombre
+        n = norm(nombre)
+        return next((h for h in L.hojas if norm(h) == n), None)
+    
+    
+    class _Hoja:
+        """Celdas de una hoja: valor en caché, fórmula y estilo."""
+    
+        def __init__(self, L: X.Libro, nombre: str):
+            self.nombre = nombre
+            self.v: dict[str, object] = {}
+            self.f: dict[str, str] = {}
+            self.s: dict[str, str] = {}
+            xml = L.hoja_xml(nombre)
+            for num, _, fila_xml, _, _ in X.filas(xml):
+                for col, (a, interior, _) in X.celdas(fila_xml).items():
+                    ref = f"{col}{num}"
+                    if a.get("s"):
+                        self.s[ref] = a["s"]
+                    if interior:
+                        m = re.search(r"<f\b[^>]*>(.*?)</f>", interior, flags=re.S)
+                        if m:
+                            self.f[ref] = X._desescapar(m.group(1))
+                        self.v[ref] = L.valor_celda(a, interior)
+    
+        def txt(self, ref) -> str:
+            v = self.v.get(ref)
+            return "" if v is None else str(v)
+    
+        def buscar(self, patron: str, cols: str = "ABCDEFGHIJKLMN", desde: int = 1, hasta: int = 2000) -> int | None:
+            """Primera fila (>= desde) donde alguna de las columnas contiene el texto (normalizado)."""
+            p = norm(patron)
+            filas = sorted({X.separar_ref(r)[1] for r in self.v})
+            for f in filas:
+                if f < desde or f > hasta:
+                    continue
+                for c in cols:
+                    if p in norm(self.v.get(f"{c}{f}")):
+                        return f
+            return None
+    
+    
+    def _fecha(v) -> date | None:
+        if isinstance(v, datetime):
+            return v.date()
+        if isinstance(v, date):
+            return v
+        if isinstance(v, (int, float)) and 20000 < v < 80000:
+            return X.serial_a_fecha(v)
+        return None
+    
+    
+    def _num(v) -> float | None:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(str(v).replace(",", "."))
+        except (TypeError, ValueError):
+            return None
+    
+    
+    # ------------------------------------------------------------------ plantilla
+    
+    @dataclass
+    class PlantillaSemanal:
+        datos: bytes
+        hojas: dict[str, str]                      # nombre lógico → nombre real
+        numero: int
+        inicio: date
+        fin: date
+        # Portada
+        revisiones: list[dict] = field(default_factory=list)
+        filas_rev: list[int] = field(default_factory=list)
+        # Resumen ejecutivo
+        celda_titulo: str = "I3"
+        celdas_titulo: list[str] = field(default_factory=list)
+        celda_inicio: str = "H4"
+        financieros: dict[str, float] = field(default_factory=dict)       # celda → valor
+        etiquetas_fin: dict[str, str] = field(default_factory=dict)       # celda → etiqueta
+        edp: list[dict] = field(default_factory=list)                     # {fila, nombre, monto}
+        criticas: list[dict] = field(default_factory=list)                # {fila, texto, obs}
+        alertas: list[dict] = field(default_factory=list)                 # {fila, tema, detalle}
+        hitos: list[dict] = field(default_factory=list)                   # {fila, id, nombre, tipo, programada, real, comentario}
+        # Seguridad
+        seg_ultima: int = 0
+        seg_hh_acum: float = 0.0
+        seg_filas: dict[str, int] = field(default_factory=dict)           # etiqueta → fila del cuadro de índices
+        seg_valores: dict[str, tuple] = field(default_factory=dict)       # etiqueta → (acum. anterior, acum. contrato)
+        historial_hh: list[tuple] = field(default_factory=list)           # (fecha, HH acumuladas)
+        # Curva de avance
+        curva_actual: int = 0
+        curva_fechas: dict[int, date] = field(default_factory=dict)
+        # Dotación 4.0
+        dot_directos: dict[str, int] = field(default_factory=dict)        # cargo normalizado → fila
+        dot_indirectos: dict[str, int] = field(default_factory=dict)
+        dot_nombres: dict[int, str] = field(default_factory=dict)
+        dot_vacias_dir: list[int] = field(default_factory=list)
+        dot_vacias_ind: list[int] = field(default_factory=list)
+        dot_previo: dict[str, tuple] = field(default_factory=dict)        # cargo → (contratado, faena, descanso)
+        # Curva de dotación
+        mod_ultima: int = 0
+        moi_ultima: int = 0
+        mod_acum: float = 0.0
+        moi_acum: float = 0.0
+        hh_semana_previa: dict[str, float] = field(default_factory=dict)
+        # 7. Avance EC-002 Itemizado
+        itm_hoja: str | None = None
+        itm_cols_ant: list[str] = field(default_factory=list)          # CANT, HH GAN, HH GAS, PF, % PO, % POM 5
+        itm_cols_acu: list[str] = field(default_factory=list)
+        itm_filas: dict[str, list[int]] = field(default_factory=dict)   # ítem → filas
+        itm_info: dict[str, dict] = field(default_factory=dict)         # ítem → descripción, unidad, rendimiento, cant. actual
+        itm_roll: list[int] = field(default_factory=list)               # filas (ítems y subtotales) que pasan a «anterior»
+        avisos: list[str] = field(default_factory=list)
+    
+    
+    def leer_plantilla(datos: bytes) -> PlantillaSemanal:
+        L = X.Libro(datos)
+        nombres = {}
+        for clave, nombre in (("resumen", HOJA_RESUMEN), ("portada", HOJA_PORTADA), ("seguridad", HOJA_SEGURIDAD),
+                              ("curva", HOJA_CURVA), ("dotacion", HOJA_DOTACION), ("curva_dot", HOJA_CURVA_DOT)):
+            h = _hoja(L, nombre)
+            if not h:
+                raise ValueError(f"No se encontró la hoja «{nombre}». ¿Es un informe semanal de avance?")
+            nombres[clave] = h
+    
+        R = _Hoja(L, nombres["resumen"])
+        celda_titulo = next((r for r, v in R.v.items() if "INFORME SEMANAL N" in norm(v) and X.separar_ref(r)[1] < 10), None)
+        if not celda_titulo:
+            raise ValueError("No se encontró el título «INFORME SEMANAL N°…» en el Resumen Ejecutivo.")
+        m = re.search(r"N\s*[°ºO]?\s*(\d+)", norm(R.v[celda_titulo]))
+        numero = int(m.group(1)) if m else 0
+        fila_t = X.separar_ref(celda_titulo)[1]
+        celda_inicio, inicio = None, None
+        for f in (fila_t + 1, fila_t, fila_t + 2):
+            for c in "ABCDEFGHIJ":
+                d = _fecha(R.v.get(f"{c}{f}"))
+                if d and f"{c}{f}" not in R.f:
+                    celda_inicio, inicio = f"{c}{f}", d
+                    break
+            if inicio:
+                break
+        if not inicio:
+            raise ValueError("No se encontró la fecha de inicio de la semana en el Resumen Ejecutivo.")
+        pl = PlantillaSemanal(datos, nombres, numero, inicio, inicio + timedelta(days=6), celda_titulo=celda_titulo,
+                              celda_inicio=celda_inicio)
+        # el título se repite en algunas hojas (fuera del área de impresión): se actualizan todos los que no son fórmula
+        for clave, h in nombres.items():
+            H = R if clave == "resumen" else _Hoja(L, h)
+            for ref, v in H.v.items():
+                if X.separar_ref(ref)[1] < 10 and ref not in H.f and re.search(r"INFORME SEMANAL N\s*[°º]", str(v or "")):
+                    pl.celdas_titulo.append(f"{clave}!{ref}")
+    
+        # --- Portada: registro de revisiones
+        P = _Hoja(L, nombres["portada"])
+        f_rev = P.buscar("REGISTRO DE REVISIONES")
+        if f_rev:
+            f_cab = next((f for f in range(f_rev, f_rev + 5) if norm(P.v.get(f"D{f}")) == "REV"), f_rev + 2)
+            for f in range(f_cab + 1, f_cab + 12):
+                if not any(P.v.get(f"{c}{f}") not in (None, "", " ") for c in COLS_REV):
+                    if pl.filas_rev:
+                        break
+                    continue
+                pl.filas_rev.append(f)
+                pl.revisiones.append({"rev": P.txt(f"D{f}"), "fecha": _fecha(P.v.get(f"E{f}")), "aprobo": P.txt(f"F{f}"),
+                                      "reviso": P.txt(f"G{f}"), "preparo": P.txt(f"H{f}"), "emitido": P.txt(f"I{f}")})
+    
+        # --- Datos financieros
+        f_fin = R.buscar("Datos Financieros")
+        if f_fin:
+            for f in range(f_fin, f_fin + 15):
+                et = norm(R.v.get(f"D{f}"))
+                if et and f"E{f}" in R.v and f"E{f}" not in R.f and _num(R.v.get(f"E{f}")) is not None:
+                    pl.financieros[f"E{f}"] = _num(R.v[f"E{f}"])
+                    pl.etiquetas_fin[f"E{f}"] = R.txt(f"D{f}")
+                et_i = R.txt(f"I{f}")
+                if norm(et_i).startswith("EDP"):
+                    pl.edp.append({"fila": f, "nombre": et_i.strip(), "monto": _num(R.v.get(f"J{f}"))})
+    
+        # --- Actividades críticas / Consideraciones y alertas
+        f_cri = R.buscar("Actividades Cr", cols="DEFGH")
+        f_ale = R.buscar("Consideraciones y Alertas", cols="DEFGH")
+        f_hit = R.buscar("Hitos Contractuales", cols="CD")
+        if f_cri:
+            fin_cri = (f_ale or f_cri + 15) - 1
+            for f in range(f_cri + 1, fin_cri):
+                if f"E{f}" in R.v or f"F{f}" in R.v:
+                    pl.criticas.append({"fila": f, "texto": R.txt(f"F{f}").strip(), "obs": R.txt(f"L{f}").strip()})
+        if f_ale:
+            fin_ale = (f_hit or f_ale + 15) - 1
+            for f in range(f_ale + 1, fin_ale):
+                if R.txt(f"F{f}").strip() or R.txt(f"L{f}").strip():
+                    pl.alertas.append({"fila": f, "tema": R.txt(f"F{f}").strip(), "detalle": R.txt(f"L{f}").strip()})
+        if f_hit:
+            f_cab = R.buscar("ID de actividad", cols="DEF", desde=f_hit)
+            if f_cab:
+                for f in range(f_cab + 1, f_cab + 40):
+                    ide = R.txt(f"E{f}").strip()
+                    if not re.match(r"[A-Z]{2}-", ide):
+                        if pl.hitos:
+                            break
+                        continue
+                    pl.hitos.append({"fila": f, "id": ide, "nombre": R.txt(f"F{f}").strip(), "tipo": R.txt(f"J{f}").strip(),
+                                     "programada": _fecha(R.v.get(f"K{f}")), "real": _fecha(R.v.get(f"L{f}")),
+                                     "comentario": R.txt(f"M{f}").strip()})
+    
+        # --- Seguridad
+        S = _Hoja(L, nombres["seguridad"])
+        for f in range(10, 400):
+            d, n = _fecha(S.v.get(f"L{f}")), _num(S.v.get(f"N{f}"))
+            if d and n is not None:
+                pl.seg_ultima, pl.seg_hh_acum = f, n
+                pl.historial_hh.append((d, n))
+        if not pl.seg_ultima:
+            pl.avisos.append("2. Seguridad: no se encontró la tabla de HH acumuladas (columnas L y N).")
+        for et in ("N° De Accidentes STP", "N° De Accidentes CTP", "Días Perdidos", "Total trabajadores", "HH Trabajadas"):
+            f = S.buscar(et, cols="BC")
+            if f:
+                pl.seg_filas[et] = f
+                pl.seg_valores[et] = (_num(S.v.get(f"F{f}")), _num(S.v.get(f"H{f}")))
+    
+        # --- Curva de avance: fila de la semana en curso = la que tiene las fórmulas del itemizado en AD
+        C = _Hoja(L, nombres["curva"])
+        for f in range(55, 400):
+            d = _fecha(C.v.get(f"C{f}"))
+            if d:
+                pl.curva_fechas[f] = d
+            if "ITEMIZADO" in norm(C.f.get(f"AD{f}", "")):
+                pl.curva_actual = f
+        if not pl.curva_actual:
+            pl.avisos.append("3. Curva de Avance: no se encontró la fila de la semana con fórmulas del itemizado (columna AD).")
+    
+        # --- 4.0 Dotación
+        D = _Hoja(L, nombres["dotacion"])
+        f_dir = D.buscar("MANO DE OBRA DIRECTA", cols="BC")
+        f_ind = D.buscar("MANO DE OBRA INDIRECTA", cols="BC")
+        f_tot = D.buscar("Directos", cols="BC", desde=(f_ind or 1) + 1)
+        if f_dir and f_ind and f_tot:
+            for f in range(f_dir + 1, f_ind):
+                _registrar_cargo(pl, D, f, pl.dot_directos, pl.dot_vacias_dir, ("D", "F", "H"))
+            for f in range(f_ind + 1, f_tot - 1):
+                _registrar_cargo(pl, D, f, pl.dot_indirectos, pl.dot_vacias_ind, ("E", "G", "I"))
+        else:
+            pl.avisos.append("4.0 Dotación: no se encontraron las secciones de mano de obra directa e indirecta.")
+    
+        # --- 5. Curva Dotación (MOD arriba, MOI abajo)
+        CD = _Hoja(L, nombres["curva_dot"])
+        f_moi = CD.buscar("5.2", cols="ABCD") or 10 ** 6
+        for f in range(10, 600):
+            if _num(CD.v.get(f"N{f}")) is not None and _fecha(CD.v.get(f"E{f}")):
+                if f < f_moi:
+                    pl.mod_ultima, pl.mod_acum = f, _num(CD.v[f"N{f}"])
+                else:
+                    pl.moi_ultima, pl.moi_acum = f, _num(CD.v[f"N{f}"])
+        for clave, fila in (("MOD", pl.mod_ultima), ("MOI", pl.moi_ultima)):
+            if fila:
+                pl.hh_semana_previa[clave] = _num(CD.v.get(f"L{fila}")) or 0.0
+            else:
+                pl.avisos.append(f"5. Curva Dotación: no se encontró la tabla de HH reales {clave}.")
+        _leer_itemizado(L, pl)
+        return pl
+    
+    
+    def _leer_itemizado(L: X.Libro, pl: PlantillaSemanal):
+        """Hoja «7.Avance EC-002 Itemizado»: columnas de avance anterior y acumulado, y filas de cada ítem."""
+        hoja = next((h for h in L.hojas if norm(h) == "7.AVANCE EC-002 ITEMIZADO"), None)
+        if not hoja:
+            pl.avisos.append("No se encontró la hoja «7.Avance EC-002 Itemizado»: el avance por ítem queda igual.")
+            return
+        H = _Hoja(L, hoja)
+        f_cab = next((f for f in range(1, 40) if any(norm(H.v.get(f"{c}{f}")) == "AVANCE ACUMULADO"
+                                                     for c in ("AZ", "BA", "BB", "AY"))), None)
+        if not f_cab:
+            pl.avisos.append("7. Itemizado: no se encontraron las columnas «AVANCE ANTERIOR / ACUMULADO».")
+            return
+        col_ant = next((X.separar_ref(r)[0] for r, v in H.v.items() if X.separar_ref(r)[1] == f_cab and norm(v) == "AVANCE ANTERIOR"), None)
+        col_acu = next((X.separar_ref(r)[0] for r, v in H.v.items() if X.separar_ref(r)[1] == f_cab and norm(v) == "AVANCE ACUMULADO"), None)
+        if not col_ant or not col_acu:
+            return
+        pl.itm_hoja = hoja
+        pl.itm_cols_ant = [X.num_a_col(X.col_a_num(col_ant) + i) for i in range(6)]
+        pl.itm_cols_acu = [X.num_a_col(X.col_a_num(col_acu) + i) for i in range(6)]
+        c_cant = pl.itm_cols_acu[0]
+        for ref, v in H.v.items():
+            col, f = X.separar_ref(ref)
+            if col != "F" or f <= f_cab + 2 or not re.match(r"\d{2}\.\d{2}\.\d{3}\.\d{3,4}", str(v or "").strip()):
+                continue
+            item = str(v).strip()
+            pl.itm_filas.setdefault(item, []).append(f)
+            info = pl.itm_info.setdefault(item, {"descripcion": H.txt(f"M{f}").strip(), "unidad": H.txt(f"N{f}").strip(),
+                                                 "especialidad": H.txt(f"E{f}").strip(), "rend": _num(H.v.get(f"AE{f}")),
+                                                 "cant": 0.0, "pom": 0.0})
+            info["cant"] += _num(H.v.get(f"{c_cant}{f}")) or 0.0
+            info["pom"] += _num(H.v.get(f"AD{f}")) or 0.0
+            if not info["rend"]:
+                info["rend"] = _num(H.v.get(f"AE{f}"))
+        for filas in pl.itm_filas.values():
+            filas.sort()
+        pl.itm_roll = sorted({X.separar_ref(r)[1] for r in H.v
+                              if X.separar_ref(r)[0] in pl.itm_cols_acu and X.separar_ref(r)[1] > f_cab + 2})
+    
+    
+    # ------------------------------------------------------------------ planillas de avance (piping, …)
+    
+    def leer_planilla_avance(datos: bytes, archivo: str = "") -> dict:
+        """Planilla de avance de una especialidad (piping, civil, mecánica-estructuras, eléctrica): de su itemizado EC-002
+        toma, por ítem, la cantidad acumulada WEEKLY (CANT bajo el primer «AVANCE ACUMULADO»). Solo los ítems que la
+        planilla controla (su «Planilla de control» es una hoja del archivo, o tienen avance).
+        Devuelve {"items": {ítem: {"cant": acumulada, "anterior": cant. anterior, "descripcion": …}}, "hoja": …}."""
+        p = CUB.leer_planilla(datos, archivo, con_detalle=False)
+        return desde_cubicacion(p)
+    
+    
+    def desde_cubicacion(p) -> dict:
+        items = {k: {"cant": it.acumulado, "anterior": it.anterior, "descripcion": it.descripcion,
+                     "disciplina": it.disciplina}
+                 for k, it in p.items.items() if abs(it.acumulado) > 1e-9 or abs(it.anterior) > 1e-9}
+        if not items:
+            raise ValueError("no se encontraron ítems con avance en el itemizado de la planilla.")
+        return {"archivo": p.archivo, "hoja": p.hoja_itemizado, "items": items}
+    
+    
+    def _registrar_cargo(pl, D: _Hoja, f: int, destino: dict, vacias: list, cols: tuple):
+        nombre = D.txt(f"B{f}").strip()
+        if not nombre:
+            if destino and any(f"{c}{f}" in D.s for c in cols):      # fila libre entre cargos (no la de separación)
+                vacias.append(f)
+            return
+        if norm(nombre).startswith("MANO DE OBRA"):
+            return
+        destino[norm(nombre)] = f
+        pl.dot_nombres[f] = nombre
+        pl.dot_previo[norm(nombre)] = tuple(_num(D.v.get(f"{c}{f}")) for c in cols)
+    
+    
+    # ------------------------------------------------------------------ datos de la semana (BD Personal)
+    
+    @dataclass
+    class DatosPersonal:
+        filas: list[tuple]                  # (fecha, cargo, moi_mod, tipo_turno, codigo, acreditado)
+        fechas: set[date]
+    
+    
+    def leer_bd_personal(datos_diario: bytes) -> DatosPersonal:
+        """Lee la hoja BD Personal de un informe diario (todas las fechas)."""
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(datos_diario), read_only=True, data_only=True)
+        if "BD Personal" not in wb.sheetnames:
+            raise ValueError("El informe diario no tiene la hoja «BD Personal».")
+        ws = wb["BD Personal"]
+        cab, idx, filas = None, {}, []
+        for r in ws.iter_rows(min_row=1, max_col=40, values_only=True):
+            if cab is None:
+                n = [norm(x) for x in r]
+                if "RUT" in n and "CARGO" in n:
+                    cab = n
+                    def col(*nombres, empieza=False):
+                        for o in nombres:
+                            for j, x in enumerate(n):
+                                if (x.startswith(o) if empieza else x == o):
+                                    return j
+                        return None
+                    idx = {"fecha": col("FECHA"), "cargo": col("CARGO"), "tipo": col("MOI/MOD"),
+                           "turno": col("TIPO DE TURNO"), "cod": col("PERSONAL EN FAENA", empieza=True),
+                           "acr": col("ACREDITADO")}
+                    if None in (idx["fecha"], idx["cargo"], idx["tipo"], idx["cod"]):
+                        raise ValueError("BD Personal sin las columnas Fecha, Cargo, MOI/MOD o Personal en Faena.")
+                continue
+            d = _fecha(r[idx["fecha"]]) if idx["fecha"] < len(r) else None
+            if not d:
+                continue
+            g = lambda k: (r[idx[k]] if idx.get(k) is not None and idx[k] < len(r) else None)
+            filas.append((d, str(g("cargo") or "").strip(), norm(g("tipo")), norm(g("turno")), norm(g("cod")), norm(g("acr"))))
+        wb.close()
+        return DatosPersonal(filas, {f[0] for f in filas})
+    
+    
+    def _en_faena(fila) -> bool:
+        _, _, tipo, turno, cod, acr = fila
+        if turno.startswith("NOCHE"):
+            return cod == "TN"
+        if tipo.startswith("IND"):
+            return cod in ("T", "TT", "TC") and acr == "SI"
+        return cod == "T"
+    
+    
+    @dataclass
+    class Semana:
+        inicio: date
+        fin: date
+        numero: int
+        hh_mod: float = 0.0
+        hh_moi: float = 0.0
+        dotacion: dict[str, dict] = field(default_factory=dict)   # cargo → {tipo, contratado, faena, descanso}
+        dias_sin_datos: list[date] = field(default_factory=list)
+    
+    
+    def calcular_semana(pl: PlantillaSemanal, bd: DatosPersonal, inicio: date | None = None) -> Semana:
+        inicio = inicio or pl.inicio + timedelta(days=7)
+        fin = inicio + timedelta(days=6)
+        dias = {inicio + timedelta(days=i) for i in range(7)}
+        sem = Semana(inicio, fin, pl.numero + 1, dias_sin_datos=sorted(dias - bd.fechas))
+        n_dias = max(1, len(dias & bd.fechas))
+        acum = defaultdict(lambda: {"tipo": "", "contratado": 0, "faena": 0})
+        for fila in bd.filas:
+            if fila[0] not in dias:
+                continue
+            faena = _en_faena(fila)
+            if faena:
+                if fila[2].startswith("IND"):
+                    sem.hh_moi += HORAS_DIA
+                else:
+                    sem.hh_mod += HORAS_DIA
+            a = acum[fila[1]]
+            a["tipo"] = "Indirecto" if fila[2].startswith("IND") else "Directo"
+            a["contratado"] += 1
+            a["faena"] += faena
+        for cargo, a in acum.items():
+            c, f = round(a["contratado"] / n_dias, 1), round(a["faena"] / n_dias, 1)
+            sem.dotacion[cargo] = {"tipo": a["tipo"], "contratado": c, "faena": f, "descanso": round(c - f, 1)}
+        return sem
+    
+    
+    # ------------------------------------------------------------------ entradas editables
+    
+    @dataclass
+    class EntradasSemanal:
+        numero: int
+        inicio: date
+        revisiones: list[dict]
+        financieros: dict[str, float]
+        edp: list[dict]
+        criticas: list[dict]
+        alertas: list[dict]
+        hitos: list[dict]
+        seguridad: dict[str, float]          # etiqueta → valor del período (accidentes, días perdidos)
+        hh_mod: float
+        hh_moi: float
+        dotacion: dict[str, dict]
+        avance_items: dict[str, float] = field(default_factory=dict)   # ítem → cantidad acumulada nueva (planillas)
+        fuentes_avance: list[str] = field(default_factory=list)
+    
+    
+    def hitos_desde_p6(pl: PlantillaSemanal, actividades) -> list[dict]:
+        """Fecha real de los hitos terminados según el último programa P6 cargado (actividades del corte)."""
+        salida = [dict(h) for h in pl.hitos]
+        if actividades is None or len(actividades) == 0:
+            return salida
+        por_id = {str(r["task_code"]).strip(): r for _, r in actividades.iterrows()}
+        for h in salida:
+            r = por_id.get(h["id"].strip())
+            if r is not None and str(r.get("estado", "")).startswith("Complet") and not h.get("real"):
+                d = _fecha(datetime.fromisoformat(str(r["fin"])[:10])) if r.get("fin") else None
+                if d:
+                    h["real"] = d
+                    h["origen"] = "P6"
+        return salida
+    
+    
+    # ------------------------------------------------------------------ generación
+    
+    def _cargos_nuevos(pl: PlantillaSemanal, dotacion: dict) -> dict[str, list[str]]:
+        nuevos = {"Directo": [], "Indirecto": []}
+        for cargo, d in dotacion.items():
+            k = norm(cargo)
+            if k not in pl.dot_directos and k not in pl.dot_indirectos:
+                nuevos["Indirecto" if d.get("tipo") == "Indirecto" else "Directo"].append(cargo)
+        return nuevos
+    
+    
+    def _ampliar_dotacion(pl: PlantillaSemanal, dotacion: dict) -> PlantillaSemanal:
+        """Si hay cargos nuevos y no quedan filas libres en 4.0 Dotación, inserta las filas que faltan dentro de la sección
+        (así los totales =SUM(...) las incluyen) y vuelve a leer la planilla."""
+        nuevos = _cargos_nuevos(pl, dotacion)
+        falta_d = len(nuevos["Directo"]) - len(pl.dot_vacias_dir)
+        falta_i = len(nuevos["Indirecto"]) - len(pl.dot_vacias_ind)
+        if falta_d <= 0 and falta_i <= 0:
+            return pl
+        L = X.Libro(pl.datos)
+        for filas, falta in sorted([(list(pl.dot_indirectos.values()), falta_i), (list(pl.dot_directos.values()), falta_d)],
+                                   key=lambda t: -(max(t[0]) if t[0] else 0)):
+            if falta > 0 and filas:
+                X.insertar_filas(L, pl.hojas["dotacion"], max(filas), falta)
+        return _marcar_copias(leer_plantilla(L.bytes(recalcular=True)))
+    
+    
+    def _marcar_copias(pl: PlantillaSemanal) -> PlantillaSemanal:
+        """Tras insertar filas, el mismo cargo aparece repetido (copias de la fila modelo): todas menos la última quedan libres."""
+        for seccion, vacias in (("dot_directos", "dot_vacias_dir"), ("dot_indirectos", "dot_vacias_ind")):
+            por_cargo = defaultdict(list)
+            for f in sorted(pl.dot_nombres):
+                nombre = norm(pl.dot_nombres[f])
+                if getattr(pl, seccion).get(nombre) is not None:
+                    por_cargo[nombre].append(f)
+            for nombre, filas in por_cargo.items():
+                if len(filas) > 1:
+                    getattr(pl, seccion)[nombre] = filas[-1]
+                    getattr(pl, vacias).extend(filas[:-1])
+            getattr(pl, vacias).sort()
+        return pl
+    
+    
+    def generar(pl: PlantillaSemanal, ent: EntradasSemanal) -> tuple[bytes, list[str]]:
+        pl = _ampliar_dotacion(pl, ent.dotacion)
+        L = X.Libro(pl.datos)
+        avisos: list[str] = []
+        fin = ent.inicio + timedelta(days=6)
+    
+        # --- Resumen ejecutivo
+        R = _Hoja(L, pl.hojas["resumen"])
+        def titulo_nuevo(t):
+            return re.sub(r"(N\s*[°º]\s*)\d+", lambda m: f"{m.group(1)}{ent.numero}", t)
+        por_hoja: dict[str, dict] = defaultdict(dict)
+        for item in pl.celdas_titulo:
+            clave, ref = item.split("!")
+            if clave != "resumen":
+                por_hoja[clave][ref] = titulo_nuevo(_Hoja(L, pl.hojas[clave]).txt(ref))
+        for clave, cam in por_hoja.items():
+            L.guardar_hoja(pl.hojas[clave], X.fijar_celdas(L.hoja_xml(pl.hojas[clave]), cam))
+        cambios: dict[str, object] = {pl.celda_inicio: ent.inicio}
+        for item in pl.celdas_titulo:
+            clave, ref = item.split("!")
+            if clave == "resumen":
+                cambios[ref] = titulo_nuevo(R.txt(ref))
+        for ref, v in ent.financieros.items():
+            cambios[ref] = v
+        for e in ent.edp:
+            cambios[f"J{e['fila']}"] = e.get("monto")
+        for c in ent.criticas:
+            cambios[f"F{c['fila']}"] = c.get("texto") or None
+            cambios[f"L{c['fila']}"] = c.get("obs") or None
+        for a in ent.alertas:
+            cambios[f"F{a['fila']}"] = a.get("tema") or None
+            cambios[f"L{a['fila']}"] = a.get("detalle") or None
+        for h in ent.hitos:
+            cambios[f"L{h['fila']}"] = h.get("real")
+            cambios[f"M{h['fila']}"] = h.get("comentario") or None
+        L.guardar_hoja(pl.hojas["resumen"], X.fijar_celdas(L.hoja_xml(pl.hojas["resumen"]), cambios))
+    
+        # --- Portada
+        P = _Hoja(L, pl.hojas["portada"])
+        cambios, estilos = {}, {}
+        filas_rev = list(pl.filas_rev)
+        while len(filas_rev) < len(ent.revisiones):
+            filas_rev.append((filas_rev[-1] if filas_rev else 26) + 1)
+        for i, f in enumerate(filas_rev):
+            r = ent.revisiones[i] if i < len(ent.revisiones) else {}
+            for col, k in zip(COLS_REV, ("rev", "fecha", "aprobo", "reviso", "preparo", "emitido")):
+                cambios[f"{col}{f}"] = r.get(k) or None
+                if pl.filas_rev:
+                    estilos[f"{col}{f}"] = P.s.get(f"{col}{pl.filas_rev[-1]}")
+        L.guardar_hoja(pl.hojas["portada"], X.fijar_celdas(L.hoja_xml(pl.hojas["portada"]), cambios, estilos))
+    
+        # --- Seguridad
+        S = _Hoja(L, pl.hojas["seguridad"])
+        if pl.seg_ultima:
+            u, n = pl.seg_ultima, pl.seg_ultima + 1
+            hh_sem = ent.hh_mod + ent.hh_moi
+            cambios = {f"L{n}": (f"=+L{u}+7", X.fecha_a_serial(fin)), f"M{n}": (f"=+M{u}+1",), f"N{n}": round(pl.seg_hh_acum + hh_sem),
+                       f"O{n}": (f"=+(N{n}/11)*12",), f"Q{n}": (f"=+O{n}/12/7",), f"R{n}": (f"=+Q{n}-Q{u}",)}
+            estilos = {f"{c}{n}": S.s.get(f"{c}{u}") for c in "LMNOQR"}
+            # Acumulado anterior = acumulado del informe anterior (filas «Total trabajadores» y «HH Trabajadas»)
+            q_u, o_u = _num(S.v.get(f"Q{u}")), _num(S.v.get(f"O{u}"))
+            if "Total trabajadores" in pl.seg_filas:
+                f = pl.seg_filas["Total trabajadores"]
+                cambios[f"F{f}"] = q_u
+                cambios[f"H{f}"] = (f"=+Q{n}",)
+            if "HH Trabajadas" in pl.seg_filas:
+                f = pl.seg_filas["HH Trabajadas"]
+                cambios[f"F{f}"] = o_u
+                cambios[f"H{f}"] = (f"=+O{n}",)
+            for et in ("N° De Accidentes STP", "N° De Accidentes CTP", "Días Perdidos"):
+                if et in pl.seg_filas:
+                    f = pl.seg_filas[et]
+                    previo = pl.seg_valores[et][1] or 0
+                    cambios[f"F{f}"] = previo
+                    cambios[f"H{f}"] = previo + (ent.seguridad.get(et) or 0)
+            L.guardar_hoja(pl.hojas["seguridad"], X.fijar_celdas(L.hoja_xml(pl.hojas["seguridad"]), cambios, estilos))
+    
+        # --- Curva de avance: congelar la semana anterior y pasar las fórmulas a la nueva
+        C = _Hoja(L, pl.hojas["curva"])
+        if pl.curva_actual:
+            u, n = pl.curva_actual, pl.curva_actual + 1
+            if pl.curva_fechas.get(n) and pl.curva_fechas[n] != fin:
+                avisos.append(f"3. Curva de Avance: la fila siguiente es del {pl.curva_fechas[n]:%d-%m-%Y} y la semana nueva "
+                              f"termina el {fin:%d-%m-%Y}; revisa la tabla.")
+            cambios = {}
+            for col in ("AB", "AC", "AD", "AE", "AF", "AG"):
+                ref = f"{col}{u}"
+                if ref in C.f:
+                    cambios[ref] = C.v.get(ref)                                  # queda en valor
+                    cambios[f"{col}{n}"] = ("=" + X.desplazar_relativas(C.f[ref], 1),)
+            L.guardar_hoja(pl.hojas["curva"], X.fijar_celdas(L.hoja_xml(pl.hojas["curva"]), cambios,
+                                                              {f"{c}{n}": C.s.get(f"{c}{u}") for c in ("AB", "AC", "AD", "AE", "AF", "AG")}))
+    
+        # --- 4.0 Dotación
+        cambios = {}
+        vistos = set()
+        libres = {"Directo": list(pl.dot_vacias_dir), "Indirecto": list(pl.dot_vacias_ind)}
+        D = _Hoja(L, pl.hojas["dotacion"])
+        estilos = {}
+        for cargo, d in sorted(ent.dotacion.items()):
+            k = norm(cargo)
+            directo = d.get("tipo") != "Indirecto"
+            fila = (pl.dot_directos if directo else pl.dot_indirectos).get(k) or \
+                (pl.dot_indirectos if directo else pl.dot_directos).get(k)
+            if fila is None:
+                lista = libres["Directo" if directo else "Indirecto"]
+                if not lista:
+                    avisos.append(f"4.0 Dotación: no hay fila libre para el cargo nuevo «{cargo}»; agrégalo a mano.")
+                    continue
+                fila = lista.pop(0)
+                cambios[f"B{fila}"] = cargo
+            vistos.add(fila)
+            es_dir = fila in pl.dot_directos.values() or (fila not in pl.dot_indirectos.values() and directo)
+            if es_dir:
+                cambios[f"D{fila}"], cambios[f"F{fila}"], cambios[f"H{fila}"] = d["contratado"], d["faena"], d["descanso"]
+            else:
+                cambios[f"E{fila}"], cambios[f"G{fila}"] = d["contratado"], d["faena"]
+                if f"I{fila}" not in D.f:
+                    cambios[f"I{fila}"] = (f"=+E{fila}-G{fila}",)
+        for k, fila in list(pl.dot_directos.items()):
+            if fila not in vistos:
+                cambios[f"D{fila}"] = cambios[f"F{fila}"] = cambios[f"H{fila}"] = None
+        for k, fila in list(pl.dot_indirectos.items()):
+            if fila not in vistos:
+                cambios[f"E{fila}"] = cambios[f"G{fila}"] = None
+                if f"I{fila}" not in D.f:
+                    cambios[f"I{fila}"] = None
+        L.guardar_hoja(pl.hojas["dotacion"], X.fijar_celdas(L.hoja_xml(pl.hojas["dotacion"]), cambios, estilos))
+    
+        # --- 5. Curva Dotación
+        CD = _Hoja(L, pl.hojas["curva_dot"])
+        cambios, estilos = {}, {}
+        for u, acum, hh in ((pl.mod_ultima, pl.mod_acum, ent.hh_mod), (pl.moi_ultima, pl.moi_acum, ent.hh_moi)):
+            if not u:
+                continue
+            n = u + 1
+            cambios[f"L{n}"] = (f"=+N{n}-N{u}", hh)
+            cambios[f"M{n}"] = (f"=+L{n}/77", hh / 77)
+            cambios[f"N{n}"] = round(acum + hh)
+            for c in "LMN":
+                estilos[f"{c}{n}"] = CD.s.get(f"{c}{u}")
+        L.guardar_hoja(pl.hojas["curva_dot"], X.fijar_celdas(L.hoja_xml(pl.hojas["curva_dot"]), cambios, estilos))
+    
+        # --- 7. Itemizado: el acumulado del informe anterior pasa a «avance anterior»; el acumulado nuevo sale de las
+        #     planillas de avance cargadas (los ítems sin planilla quedan con el mismo acumulado: período 0).
+        if pl.itm_hoja:
+            I = _Hoja(L, pl.itm_hoja)
+            cambios = {}
+            for f in pl.itm_roll:
+                if True:
+                    for ca, cu in zip(pl.itm_cols_ant, pl.itm_cols_acu):
+                        v = I.v.get(f"{cu}{f}")
+                        if f"{ca}{f}" in I.f:
+                            continue
+                        cambios[f"{ca}{f}"] = v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+            c_cant = pl.itm_cols_acu[0]
+            for item, cant in ent.avance_items.items():
+                filas = pl.itm_filas.get(item)
+                if not filas:
+                    continue
+                libres = [f for f in filas if f"{c_cant}{f}" not in I.f]
+                if not libres:
+                    avisos.append(f"7. Itemizado: el ítem {item} tiene fórmula en la cantidad acumulada; no se cambió.")
+                    continue
+                otras = sum(_num(I.v.get(f"{c_cant}{f}")) or 0 for f in filas if f != libres[0])
+                cambios[f"{c_cant}{libres[0]}"] = round(cant - otras, 6)
+            L.guardar_hoja(pl.itm_hoja, X.fijar_celdas(L.hoja_xml(pl.itm_hoja), cambios))
+    
+        return L.bytes(recalcular=True), avisos
+    
+    
+    def entradas_sugeridas(pl: PlantillaSemanal, sem: Semana, actividades=None) -> EntradasSemanal:
+        fin = sem.fin
+        revs = [dict(r) for r in pl.revisiones[:1]] or [{"rev": "Rev.A", "aprobo": "", "reviso": "", "preparo": "", "emitido": ""}]
+        revs[0].update({"rev": "Rev.A", "fecha": fin})
+        return EntradasSemanal(
+            numero=sem.numero, inicio=sem.inicio, revisiones=revs, financieros=dict(pl.financieros),
+            edp=[dict(e) for e in pl.edp], criticas=[dict(c) for c in pl.criticas], alertas=[dict(a) for a in pl.alertas],
+            hitos=hitos_desde_p6(pl, actividades), seguridad={"N° De Accidentes STP": 0, "N° De Accidentes CTP": 0, "Días Perdidos": 0},
+            hh_mod=sem.hh_mod, hh_moi=sem.hh_moi, dotacion=sem.dotacion)
+
+    return SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
+
+
+semanal = _modulo_semanal()
+
+# ======================================================================
 # MÓDULO: comun
 # ======================================================================
 def _modulo_comun():
@@ -8316,65 +11132,271 @@ def _modulo_tema():
     import streamlit as st
     import streamlit.components.v1 as components
     
-    NARANJO = "#FF6B00"
+    VERSION = "3.3"
+    FECHA_VERSION = "13-11-2026"
+    NARANJO = "#FA4D09"
+    AZUL = "#06205C"
     
     CSS = """<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
     :root {
-      --sy-naranjo:#FF6B00; --sy-naranjo-hover:#E65F00;
-      --sy-fondo:#F4F6F9; --sy-tarjeta:#FFFFFF; --sy-tarjeta-borde:rgba(15,23,42,.08);
-      --sy-sombra:0 4px 12px rgba(15,23,42,.06);
-      --sy-lateral:#FFFFFF; --sy-lateral-borde:#E2E8F0; --sy-suave:#64748B;
+      --sy-naranjo:#FA4D09; --sy-naranjo2:#FF7A3D; --sy-naranjo-hover:#E04406;
+      --sy-azul:#06205C; --sy-azul2:#0B2F7A; --sy-azul3:#163E94; --sy-azul-osc:#041640;
+      --sy-fondo:#F3F5F9; --sy-tarjeta:#FFFFFF; --sy-tarjeta-borde:#E3E8F1; --sy-titulo:#06205C;
+      --sy-sombra:0 6px 16px rgba(6,32,92,.06); --sy-suave:#64708A; --sy-campo:#FAFBFD;
+      --sy-curva:cubic-bezier(.22,.61,.36,1);
     }
     html[data-sy-tema="oscuro"] {
-      --sy-naranjo:#FF7A1A; --sy-naranjo-hover:#FF8F3D;
-      --sy-fondo:#0E1117; --sy-tarjeta:#161B26; --sy-tarjeta-borde:rgba(255,255,255,.08);
-      --sy-sombra:0 4px 14px rgba(0,0,0,.35);
-      --sy-lateral:#0A0F1A; --sy-lateral-borde:rgba(255,255,255,.08); --sy-suave:#94A3B8;
+      --sy-naranjo:#FF5A1A; --sy-naranjo2:#FF8A50; --sy-naranjo-hover:#FF6F33;
+      --sy-fondo:#0B1222; --sy-tarjeta:#121B30; --sy-tarjeta-borde:rgba(255,255,255,.08); --sy-titulo:#E8EEFB;
+      --sy-sombra:0 6px 18px rgba(0,0,0,.35); --sy-suave:#94A3B8; --sy-campo:#0F172A;
     }
+    html, body, [data-testid="stApp"], button, input, textarea, select {font-family:'Inter','Segoe UI',system-ui,sans-serif;}
     [data-testid="stApp"], [data-testid="stHeader"] {background:var(--sy-fondo);}
-    .block-container {padding-top:2rem;}
+    .block-container {padding-top:2.2rem;}
     
-    /* Tarjetas de indicadores */
-    [data-testid="stMetric"] {background:var(--sy-tarjeta); border:1px solid var(--sy-tarjeta-borde);
-      border-top:4px solid var(--sy-naranjo); border-radius:8px; padding:14px 16px; box-shadow:var(--sy-sombra);}
+    /* ---------- Animaciones ---------- */
+    @keyframes sy-sube {from {opacity:0; transform:translateY(14px);} to {opacity:1; transform:none;}}
+    @keyframes sy-aparece {from {opacity:0;} to {opacity:1;}}
+    @keyframes sy-flota {0%,100% {transform:rotate(45deg) translateY(0);} 50% {transform:rotate(45deg) translateY(-14px);}}
+    @keyframes sy-gira {from {transform:rotate(45deg);} to {transform:rotate(405deg);}}
+    @keyframes sy-entra-rombo {from {opacity:0; transform:rotate(0deg) scale(.6);} to {opacity:1; transform:rotate(45deg) scale(1);}}
+    @keyframes sy-late {0%,100% {box-shadow:0 0 0 0 rgba(250,77,9,.45);} 50% {box-shadow:0 0 0 7px rgba(250,77,9,0);}}
+    @keyframes sy-brillo {from {background-position:-200% 0;} to {background-position:200% 0;}}
+    @keyframes sy-desliza {from {opacity:0; transform:translateX(-12px);} to {opacity:1; transform:none;}}
+    [data-testid="stMain"] .block-container > div {animation:sy-aparece .45s var(--sy-curva);}
+    @media (prefers-reduced-motion: reduce) {*, *::before, *::after {animation:none !important; transition:none !important;}}
     
-    /* Barra lateral */
-    [data-testid="stSidebar"] {background:var(--sy-lateral); border-right:1px solid var(--sy-lateral-borde);}
-    .sy-pie {color:var(--sy-suave); font-size:.8rem;}
+    /* ---------- Títulos ---------- */
+    [data-testid="stMain"] h1 {color:var(--sy-titulo); font-weight:800; letter-spacing:-.5px; position:relative; padding-left:18px;
+      animation:sy-desliza .5s var(--sy-curva);}
+    [data-testid="stMain"] h1::before {content:""; position:absolute; left:0; top:22%; width:9px; height:9px; border-radius:2px;
+      background:var(--sy-naranjo); transform:rotate(45deg); box-shadow:0 0 0 4px rgba(250,77,9,.15);}
+    [data-testid="stMain"] h2, [data-testid="stMain"] h3 {color:var(--sy-titulo); font-weight:700;}
     
-    /* Acento naranjo de la marca en ambos modos */
-    [data-testid^="stBaseButton-primary"] {background:var(--sy-naranjo) !important; border-color:var(--sy-naranjo) !important;
-      color:#FFFFFF !important;}
-    [data-testid^="stBaseButton-primary"]:hover {background:var(--sy-naranjo-hover) !important; border-color:var(--sy-naranjo-hover) !important;}
+    /* ---------- Tarjetas de indicadores ---------- */
+    [data-testid="stMetric"] {background:var(--sy-tarjeta); border:1px solid var(--sy-tarjeta-borde); border-left:4px solid var(--sy-azul);
+      border-radius:14px; padding:16px 18px; box-shadow:var(--sy-sombra); position:relative; overflow:hidden;
+      animation:sy-sube .55s var(--sy-curva) both; transition:transform .25s var(--sy-curva), box-shadow .25s;}
+    html[data-sy-tema="oscuro"] [data-testid="stMetric"] {border-left-color:#4C79E0;}
+    [data-testid="stMetric"]::after {content:""; position:absolute; right:-26px; top:-26px; width:70px; height:70px; border-radius:16px;
+      transform:rotate(45deg); background:rgba(6,32,92,.06); transition:transform .4s var(--sy-curva);}
+    [data-testid="stMetric"]:hover {transform:translateY(-3px); box-shadow:0 12px 26px rgba(6,32,92,.12);}
+    [data-testid="stMetric"]:hover::after {transform:rotate(90deg) scale(1.15);}
+    [data-testid="stColumn"]:nth-child(even) [data-testid="stMetric"] {border-left-color:var(--sy-naranjo);}
+    [data-testid="stColumn"]:nth-child(even) [data-testid="stMetric"]::after {background:rgba(250,77,9,.12);}
+    [data-testid="stColumn"]:nth-child(2) [data-testid="stMetric"] {animation-delay:.07s;}
+    [data-testid="stColumn"]:nth-child(3) [data-testid="stMetric"] {animation-delay:.14s;}
+    [data-testid="stColumn"]:nth-child(4) [data-testid="stMetric"] {animation-delay:.21s;}
+    [data-testid="stColumn"]:nth-child(n+5) [data-testid="stMetric"] {animation-delay:.28s;}
+    [data-testid="stMetricLabel"] p {color:var(--sy-suave) !important; font-weight:600;}
+    [data-testid="stMetricValue"] {color:var(--sy-titulo); font-weight:800;}
+    
+    /* ---------- Botones ---------- */
+    [data-testid^="stBaseButton-primary"] {background:linear-gradient(90deg,var(--sy-naranjo),var(--sy-naranjo2)) !important;
+      border:0 !important; color:#FFFFFF !important; border-radius:10px !important; font-weight:600 !important;
+      box-shadow:0 8px 18px rgba(250,77,9,.28); transition:transform .2s var(--sy-curva), box-shadow .2s, filter .2s !important;}
+    [data-testid^="stBaseButton-primary"]:hover {transform:translateY(-2px); box-shadow:0 12px 24px rgba(250,77,9,.38); filter:brightness(1.05);}
+    [data-testid^="stBaseButton-primary"]:active {transform:translateY(0);}
     [data-testid^="stBaseButton-primary"] * {color:#FFFFFF !important;}
-    [data-baseweb="tab-highlight"] {background-color:var(--sy-naranjo) !important;}
-    [data-baseweb="tab"][aria-selected="true"] p {color:var(--sy-naranjo);}
+    [data-testid="stMain"] [data-testid^="stBaseButton-secondary"] {border-radius:10px !important; border:1.5px solid var(--sy-tarjeta-borde) !important;
+      background:var(--sy-tarjeta) !important; font-weight:600 !important; transition:all .2s var(--sy-curva) !important;}
+    [data-testid="stMain"] [data-testid^="stBaseButton-secondary"]:hover {border-color:var(--sy-azul3) !important; color:var(--sy-azul3) !important;
+      transform:translateY(-1px);}
+    html[data-sy-tema="oscuro"] [data-testid="stMain"] [data-testid^="stBaseButton-secondary"]:hover {border-color:#7FA2F0 !important; color:#C9D8FA !important;}
+    [data-testid="stDownloadButton"] button {border-radius:10px !important;}
     
-    /* Logo: una versión para cada fondo */
+    /* ---------- Pestañas tipo píldora ---------- */
+    [data-baseweb="tab-list"] {background:var(--sy-tarjeta); border:1px solid var(--sy-tarjeta-borde); border-radius:12px; padding:5px; gap:4px;
+      box-shadow:var(--sy-sombra);}
+    [data-baseweb="tab"] {background:transparent; border-radius:9px !important; padding:8px 14px !important; height:auto !important; transition:background .25s, color .25s;}
+    [data-baseweb="tab"] p {font-weight:600; color:var(--sy-suave);}
+    [data-baseweb="tab"]:hover {background:rgba(6,32,92,.06);}
+    [data-baseweb="tab"][aria-selected="true"] {background:var(--sy-azul) !important;}
+    html[data-sy-tema="oscuro"] [data-baseweb="tab"][aria-selected="true"] {background:var(--sy-azul3) !important;}
+    [data-baseweb="tab"][aria-selected="true"] p {color:#FFFFFF !important;}
+    [data-baseweb="tab-highlight"], [data-baseweb="tab-border"] {display:none !important;}
+    [data-baseweb="tab-panel"] {animation:sy-sube .35s var(--sy-curva);}
+    
+    /* ---------- Campos, expansores, formularios, avisos ---------- */
+    [data-baseweb="input"], [data-baseweb="select"] > div, [data-baseweb="textarea"], [data-baseweb="base-input"] {border-radius:10px !important;}
+    [data-testid="stMain"] [data-baseweb="input"]:focus-within, [data-testid="stMain"] [data-baseweb="select"] > div:focus-within {
+      border-color:var(--sy-azul3) !important; box-shadow:0 0 0 4px rgba(22,62,148,.12);}
+    [data-testid="stExpander"] details {border-radius:12px; border:1px solid var(--sy-tarjeta-borde); background:var(--sy-tarjeta);
+      box-shadow:var(--sy-sombra); transition:box-shadow .25s;}
+    [data-testid="stExpander"] details:hover {box-shadow:0 10px 22px rgba(6,32,92,.09);}
+    [data-testid="stExpander"] summary:hover p {color:var(--sy-naranjo);}
+    [data-testid="stForm"] {border-radius:14px; border:1px solid var(--sy-tarjeta-borde); background:var(--sy-tarjeta);}
+    [data-testid="stAlert"] {border-radius:12px;}
+    [data-testid="stFileUploaderDropzone"] {border-radius:12px; border:1.5px dashed rgba(22,62,148,.35); transition:border-color .2s, background .2s;}
+    [data-testid="stFileUploaderDropzone"]:hover {border-color:var(--sy-naranjo); background:rgba(250,77,9,.04);}
+    [data-testid="stDataFrame"], [data-testid="stTable"] {border-radius:12px; overflow:hidden;}
+    [data-testid="stProgress"] [role="progressbar"] > div > div > div {background:linear-gradient(90deg,var(--sy-azul3),var(--sy-naranjo)) !important;}
+    
+    /* ---------- Barra lateral (siempre azul SYNCORE) ---------- */
+    [data-testid="stSidebar"] {background:linear-gradient(180deg,#041640 0%,#06205C 60%,#0A2A6E 100%) !important;
+      border-right:0; overflow:hidden;}
+    [data-testid="stSidebar"]::before {content:""; position:absolute; width:220px; height:220px; border:2px solid rgba(250,77,9,.35);
+      border-radius:30px; right:-120px; bottom:-70px; animation:sy-gira 40s linear infinite; pointer-events:none;}
+    [data-testid="stSidebar"]::after {content:""; position:absolute; width:110px; height:110px; background:rgba(250,77,9,.85);
+      border-radius:22px; right:-50px; bottom:-55px; transform:rotate(45deg); pointer-events:none;}
+    [data-testid="stSidebarContent"] {display:flex; flex-direction:column; background:transparent !important;
+      background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px) !important;
+      background-size:40px 40px !important;}
+    [data-testid="stSidebarHeader"] {order:0;}
+    [data-testid="stSidebarUserContent"] {order:1; padding-bottom:.4rem !important;}
+    [data-testid="stSidebarNav"] {order:2; padding-bottom:1rem;}
+    [data-testid="stSidebarContent"]::after {content:"SYNCORE v__VERSION__ · Control Ejecutivo P6"; order:3; margin-top:auto;
+      padding:14px 24px 18px; font-size:11.5px; color:#7F8FB5; letter-spacing:.2px; position:relative; z-index:1;}
+    [data-testid="stSidebar"] :is(p, span, label, small, li, h1, h2, h3, div[data-testid="stCaptionContainer"]) {color:#D5DDEE !important;}
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {background:rgba(255,255,255,.07) !important; border-color:rgba(255,255,255,.18) !important;}
+    [data-testid="stSidebar"] [data-baseweb="select"] svg {fill:#D5DDEE !important; color:#D5DDEE !important;}
+    [data-testid="stSidebar"] [data-testid^="stBaseButton-secondary"] {background:rgba(255,255,255,.04) !important; border:1px solid rgba(255,255,255,.22) !important;
+      border-radius:10px !important; transition:all .2s var(--sy-curva) !important;}
+    [data-testid="stSidebar"] [data-testid^="stBaseButton-secondary"]:hover {background:rgba(250,77,9,.18) !important; border-color:var(--sy-naranjo) !important;}
+    [data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"] svg, [data-testid="stSidebarHeader"] svg {color:#D5DDEE !important; fill:#D5DDEE !important;}
+    
+    /* Menú de páginas */
+    [data-testid="stNavSectionHeader"], [data-testid="stSidebarNavItems"] header {font-size:11px !important; letter-spacing:1.4px; font-weight:700 !important;
+      text-transform:uppercase; margin-top:14px !important; padding-left:22px !important;}
+    [data-testid="stNavSectionHeader"] *, [data-testid="stSidebarNavItems"] header * {color:#7F8FB5 !important;}
+    [data-testid="stSidebarNavSeparator"] {display:none;}
+    [data-testid="stSidebarNavLink"] {border-radius:10px !important; margin:2px 10px !important; padding:8px 12px !important; position:relative;
+      transition:background .25s var(--sy-curva), transform .25s var(--sy-curva), box-shadow .25s !important; animation:sy-desliza .4s var(--sy-curva) both;}
+    [data-testid="stSidebarNavLink"]::before {content:""; flex:0 0 auto; width:11px; height:11px; margin-right:12px; border-radius:3px;
+      border:1.6px solid #7F8FB5; transform:rotate(45deg); transition:all .3s var(--sy-curva);}
+    [data-testid="stSidebarNavLink"] :is([data-testid="stIconEmoji"], [data-testid="stIconMaterial"]) {display:none !important;}
+    [data-testid="stSidebarNavLink"]:hover {background:rgba(255,255,255,.08) !important; transform:translateX(4px);}
+    [data-testid="stSidebarNavLink"]:hover::before {border-color:var(--sy-naranjo2); transform:rotate(135deg);}
+    [data-testid="stSidebarNavLink"][data-sy-activo="1"] {background:linear-gradient(90deg,rgba(250,77,9,.95),rgba(255,122,61,.85)) !important;
+      box-shadow:0 8px 18px rgba(250,77,9,.35);}
+    [data-testid="stSidebarNavLink"][data-sy-activo="1"]::before {border-color:#fff; background:#fff;}
+    [data-testid="stSidebarNavLink"][data-sy-activo="1"] span {color:#FFFFFF !important; font-weight:600 !important;}
+    [data-testid="stSidebarNavItems"] li:nth-child(2) [data-testid="stSidebarNavLink"] {animation-delay:.03s;}
+    [data-testid="stSidebarNavItems"] li:nth-child(3) [data-testid="stSidebarNavLink"] {animation-delay:.06s;}
+    [data-testid="stSidebarNavItems"] li:nth-child(4) [data-testid="stSidebarNavLink"] {animation-delay:.09s;}
+    [data-testid="stSidebarNavItems"] li:nth-child(n+5) [data-testid="stSidebarNavLink"] {animation-delay:.12s;}
+    
+    /* Tarjeta de usuario */
+    .sy-usuario {display:flex; gap:12px; align-items:center; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.09);
+      border-radius:12px; padding:10px 12px; animation:sy-sube .5s var(--sy-curva) both;}
+    .sy-usuario .sy-av {width:38px; height:38px; flex:0 0 38px; border-radius:10px; background:linear-gradient(135deg,var(--sy-naranjo),var(--sy-naranjo2));
+      display:flex; align-items:center; justify-content:center; font-weight:800; color:#fff !important; font-size:14px;}
+    .sy-usuario b {display:block; color:#fff !important; font-size:14px; line-height:1.2;}
+    .sy-usuario small {color:#A9B6D3 !important; font-size:11.5px;}
+    .sy-etq {font-size:11px; letter-spacing:1.4px; font-weight:700; color:#7F8FB5 !important; margin:14px 0 -6px 2px;}
+    .sy-pie {color:#7F8FB5 !important; font-size:.72rem;}
+    
+    /* ---------- Logo: una versión para cada fondo ---------- */
     .sy-logo {display:block; width:100%; height:auto; margin:0 auto .5rem auto;}
     .sy-logo-noche {display:none;}
     html[data-sy-tema="oscuro"] .sy-logo-dia {display:none;}
     html[data-sy-tema="oscuro"] .sy-logo-noche {display:block;}
+    [data-testid="stSidebar"] .sy-logo-dia {display:none !important;}
+    [data-testid="stSidebar"] .sy-logo-noche {display:block !important; max-width:210px; margin:0 0 .3rem 0; animation:sy-aparece .6s ease;}
     .sy-marca {text-align:center; margin:0;} .sy-marca b {color:var(--sy-naranjo); font-size:2.2rem;}
     .sy-marca span {display:block; color:var(--sy-suave);}
     
+    /* ---------- Pantalla de inicio de sesión ---------- */
+    [data-testid="stMain"] .block-container:has(.sy-login-izq) {padding:0 !important; max-width:100% !important;}
+    [data-testid="stApp"]:has(.sy-login-izq) [data-testid="stHeader"] {background:transparent !important;}
+    [data-testid="stHorizontalBlock"]:has(.sy-login-izq) {gap:0 !important; min-height:100vh; align-items:stretch;}
+    [data-testid="stColumn"]:has(.sy-login-izq) {padding:0 !important;}
+    [data-testid="stColumn"]:has(.sy-login-izq) [data-testid="stVerticalBlock"], [data-testid="stColumn"]:has(.sy-login-izq) [data-testid="stElementContainer"],
+    [data-testid="stColumn"]:has(.sy-login-izq) [data-testid="stMarkdownContainer"], [data-testid="stColumn"]:has(.sy-login-izq) [data-testid="stMarkdown"] {height:100%;}
+    [data-testid="stColumn"]:has(.sy-login-der) {padding:9vh 6vw 4vh 6vw !important; background:var(--sy-tarjeta); position:relative;
+      border-left:6px solid var(--sy-naranjo); animation:sy-sube .7s .15s var(--sy-curva) both;}
+    [data-testid="stColumn"]:has(.sy-login-der) [data-testid="stForm"] {border:0; padding:0; background:transparent;}
+    [data-testid="stColumn"]:has(.sy-login-der) [data-baseweb="input"] {height:46px; background:var(--sy-campo);}
+    .sy-login-izq {position:relative; overflow:hidden; min-height:100vh; height:100%; padding:7vh 4.5vw; color:#fff;
+      background:linear-gradient(140deg,#041640 0%,#06205C 45%,#0B2F7A 100%);}
+    .sy-login-izq .sy-grilla {position:absolute; inset:0; background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px); background-size:48px 48px;}
+    .sy-login-izq .sy-r {position:absolute; border-radius:28px; transform:rotate(45deg);}
+    .sy-r1 {width:420px; height:420px; border:2px solid rgba(250,77,9,.55); right:-130px; top:-120px; animation:sy-entra-rombo 1.1s var(--sy-curva) both, sy-gira 60s 1.1s linear infinite;}
+    .sy-r2 {width:260px; height:260px; background:rgba(250,77,9,.92); right:80px; bottom:-100px; border-radius:36px !important;
+      animation:sy-entra-rombo 1s .25s var(--sy-curva) both, sy-flota 7s 1.3s ease-in-out infinite;}
+    .sy-r3 {width:520px; height:520px; background:rgba(255,255,255,.04); left:-230px; bottom:-210px; animation:sy-entra-rombo 1.2s .1s var(--sy-curva) both;}
+    .sy-r4 {width:140px; height:140px; border:2px solid rgba(255,255,255,.25); left:52%; top:36%; border-radius:20px !important;
+      animation:sy-entra-rombo 1s .4s var(--sy-curva) both, sy-flota 6s 1.4s ease-in-out infinite;}
+    .sy-r5 {width:58px; height:58px; background:#fff; opacity:.9; left:68%; top:27%; border-radius:12px !important;
+      animation:sy-entra-rombo .9s .55s var(--sy-curva) both, sy-flota 5s 1.5s ease-in-out infinite;}
+    .sy-login-izq img {position:relative; height:82px; width:auto; animation:sy-aparece .8s ease both;}
+    .sy-login-izq h1 {position:relative; margin-top:30vh; font-size:2.9rem; font-weight:800; line-height:1.12; color:#fff !important;
+      max-width:540px; padding:0 !important; animation:sy-sube .8s .35s var(--sy-curva) both;}
+    .sy-login-izq h1::before {display:none;}
+    .sy-login-izq h1 span {color:var(--sy-naranjo);}
+    .sy-login-izq p {position:relative; margin-top:16px; color:#C9D3EA !important; font-size:1.05rem; max-width:480px; line-height:1.55;
+      animation:sy-sube .8s .5s var(--sy-curva) both;}
+    .sy-chips {position:relative; display:flex; flex-wrap:wrap; gap:10px; margin-top:24px; animation:sy-sube .8s .65s var(--sy-curva) both;}
+    .sy-chips span {border:1px solid rgba(255,255,255,.25); padding:6px 14px; border-radius:30px; font-size:13px; color:#E6ECF8;
+      transition:all .25s;}
+    .sy-chips span:hover {background:rgba(250,77,9,.2); border-color:var(--sy-naranjo);}
+    .sy-version {display:inline-flex; align-items:center; gap:9px; background:rgba(250,77,9,.1); color:var(--sy-naranjo) !important; font-weight:700;
+      font-size:12.5px; padding:6px 13px; border-radius:20px; letter-spacing:.3px;}
+    .sy-version i {width:8px; height:8px; border-radius:50%; background:var(--sy-naranjo); animation:sy-late 2s infinite;}
+    .sy-bienv {font-size:2rem; font-weight:800; color:var(--sy-titulo); margin:16px 0 2px 0; padding:0 !important; letter-spacing:-.5px;}
+    .sy-bienv-sub {color:var(--sy-suave); margin-bottom:10px;}
+    .sy-login-pie {display:flex; justify-content:space-between; color:#98A2B6; font-size:12.5px; margin-top:22px;}
+    @media (max-width: 900px) {.sy-login-izq {min-height:auto; padding:32px 24px;} .sy-login-izq h1 {margin-top:40px; font-size:2rem;}
+      [data-testid="stColumn"]:has(.sy-login-der) {padding:32px 20px !important; border-left:0; border-top:6px solid var(--sy-naranjo);}}
+    
     /* El iframe del detector no ocupa espacio */
     .element-container:has(> iframe[height="0"]), [data-testid="stElementContainer"]:has(iframe[height="0"]) {display:none;}
-    </style>"""
+    </style>""".replace("__VERSION__", VERSION)
+    
+    
+    def panel_login(logo_b64: str | None) -> str:
+        """Panel azul de la pantalla de acceso, con las figuras animadas de la marca."""
+        logo = f"<img alt='SYNCORE' src='data:image/png;base64,{logo_b64}'>" if logo_b64 else "<b style='font-size:2rem'>SYNCORE</b>"
+        return ("<div class='sy-login-izq'><div class='sy-grilla'></div><div class='sy-r sy-r3'></div><div class='sy-r sy-r1'></div>"
+                "<div class='sy-r sy-r4'></div><div class='sy-r sy-r5'></div><div class='sy-r sy-r2'></div>"
+                f"{logo}<h1>Control Ejecutivo de <span>Proyectos</span></h1>"
+                "<p>Programación P6, informes diarios, Times &amp; Material y desviaciones de recursos en una sola plataforma.</p>"
+                "<div class='sy-chips'><span>Informe diario</span><span>6WLA</span><span>T&amp;M</span><span>Dashboard</span>"
+                "<span>Desviaciones</span></div></div>")
+    
+    
+    def logo_blanco(ruta_logo: str) -> str | None:
+        logos = _logos(ruta_logo, os.path.getmtime(ruta_logo)) if os.path.exists(ruta_logo) else None
+        return logos[1] if logos else None
+    
+    
+    def tarjeta_usuario(nombre: str, rol: str) -> str:
+        import html as _h
+        partes = [p for p in str(nombre or "").split() if p]
+        ini = "".join(p[0] for p in (partes[:1] + partes[-1:] if len(partes) > 1 else partes)).upper() or "?"
+        return (f"<div class='sy-usuario'><div class='sy-av'>{_h.escape(ini)}</div>"
+                f"<div><b>{_h.escape(str(nombre or ''))}</b><small>{_h.escape(str(rol or ''))}</small></div></div>")
+    
     
     # Se inserta en el documento principal (no en el iframe) para que siga funcionando aunque el iframe se recree.
     _DETECTOR = """<script>
     (function () {
       var d = window.parent.document;
       if (d.getElementById("sy-tema-detector")) return;
+      function sy() {
+        function lum(c) { var m = (c || "").match(/[0-9.]+/g); if (!m) return 0; return (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) / 255; }
+        function tema() {
+          var a = document.querySelector('[data-testid="stApp"]'); if (!a) return;
+          var t = lum(getComputedStyle(a).color) > 0.5 ? "oscuro" : "claro";
+          if (document.documentElement.getAttribute("data-sy-tema") !== t) document.documentElement.setAttribute("data-sy-tema", t);
+        }
+        function ruta(h) { return new URL(h, location.href).pathname.replace(/[/]+$/, ""); }
+        function activo() {
+          var ls = document.querySelectorAll('a[data-testid="stSidebarNavLink"]'); if (!ls.length) return;
+          var p = ruta(location.href), hay = false;
+          ls.forEach(function (a) {
+            var on = ruta(a.href) === p; if (on) hay = true;
+            if ((a.getAttribute("data-sy-activo") === "1") !== on) a.setAttribute("data-sy-activo", on ? "1" : "0");
+          });
+          if (!hay) ls[0].setAttribute("data-sy-activo", "1");
+        }
+        tema(); activo(); setInterval(function () { tema(); activo(); }, 300);
+      }
       var s = d.createElement("script");
       s.id = "sy-tema-detector";
-      s.textContent = "(function(){" +
-        "function lum(c){var m=(c||'').match(/[0-9.]+/g);if(!m)return 0;return(0.2126*m[0]+0.7152*m[1]+0.0722*m[2])/255;}" +
-        "function aplicar(){var a=document.querySelector('[data-testid=\\"stApp\\"]');if(!a)return;" +
-        "var t=lum(getComputedStyle(a).color)>0.5?'oscuro':'claro';" +
-        "if(document.documentElement.getAttribute('data-sy-tema')!==t)document.documentElement.setAttribute('data-sy-tema',t);}" +
-        "aplicar();setInterval(aplicar,400);})();";
+      s.textContent = "(" + sy.toString() + ")();";
       d.head.appendChild(s);
     })();
     </script>"""
@@ -8850,6 +11872,1174 @@ def _modulo_importar():
 importar = _modulo_importar()
 
 # ======================================================================
+# MÓDULO: vcubicar
+# ======================================================================
+def _modulo_vcubicar():
+    import datetime as dt
+    from dataclasses import asdict
+    
+    import pandas as pd
+    import streamlit as st
+    
+    C = cubicacion
+    P = cubicar_plano
+    LP = lector_planos
+    c = comun
+    
+    ICONOS = {"Obras civiles": "🧱", "Estructura": "🏗️", "Mecánica": "⚙️", "Piping": "🔧", "Eléctricos": "⚡"}
+    _WIDGETS_META = ("cp_disc", "cp_plano", "cp_rev", "cp_area", "cp_desc")
+    
+    
+    def seccion():
+        cid = c.contrato_id()
+        _aplicar_pendiente()
+        catalogo = _catalogo(cid)
+        st.markdown("Carga el **plano o isométrico** (PDF). En isométricos de piping la app **lee las tablas y arma la "
+                    "cubicación sola**; en las demás disciplinas digitas lo que ves en el plano. En ambos casos calcula "
+                    "cantidad, ítem EC-002, rendimiento y HH, sin depender de ninguna planilla existente.")
+    
+        # 1. plano
+        st.subheader("1 · Plano")
+        up = st.file_uploader("Plano o isométrico (PDF)", type=["pdf"], key="up_cp_pdf")
+        if up is not None and st.session_state.get("cp_pdf_nombre") != up.name:
+            st.session_state["cp_pdf_nombre"] = up.name
+            st.session_state["cp_pdf"] = up.getvalue()
+            m = P.meta_de_nombre(up.name)
+            st.session_state["cp_pendiente"] = {"meta": {"plano": m["plano"], "rev": m["rev"], "area": m["area"],
+                                                         "disciplina": m["disciplina"] or st.session_state.get("cp_disc")}}
+            st.rerun()
+        a, b, d, e = st.columns([1.1, 2.2, 0.6, 0.7])
+        disc = a.selectbox("Disciplina", P.DISCIPLINAS, format_func=lambda x: f"{ICONOS[x]} {x}", key="cp_disc")
+        plano = b.text_input("N° de plano", key="cp_plano", placeholder="EAL2LDHR-DD-2962-PIP-ISO-1001")
+        rev = d.text_input("Rev.", key="cp_rev")
+        area = e.text_input("Área", key="cp_area")
+        desc = st.text_input("Descripción / línea / ubicación", key="cp_desc",
+                             placeholder='2962-RA-S13-0001-24"-N · Fundaciones calderas · Pipe rack…',
+                             help="Ayuda a proponer el ítem EC-002 correcto (los ítems del contrato van por ubicación).")
+        if st.session_state.get("cp_pdf"):
+            _lectura_automatica(cid, disc)
+        if not catalogo:
+            st.warning("No hay **itemizado EC-002** cargado: la app calcula cantidades pero no puede proponer ítems ni HH. "
+                       "Carga cualquier planilla de avance en **📥 Cargar planillas**, o sube aquí un Excel con la hoja "
+                       "de itemizado.")
+        with st.expander(f"Itemizado EC-002 del contrato ({len(catalogo)} ítems)" if catalogo else
+                         "Cargar itemizado EC-002", expanded=not catalogo):
+            up_cat = st.file_uploader("Excel con la hoja de itemizado (planilla de avance o informe semanal)",
+                                      type=["xlsx", "xlsm"], key="up_cp_cat")
+            if up_cat is not None and st.button("Usar este itemizado", key="btn_cp_cat"):
+                try:
+                    nuevo = P.catalogo_de_planilla(up_cat.getvalue())
+                    db.guardar_config(cid, "catalogo_ec002", P.unir_catalogos(catalogo, nuevo))
+                    st.success(f"Itemizado cargado: {len(nuevo)} ítems.")
+                    catalogo = _catalogo(cid)
+                except Exception as ex:
+                    st.error(f"{up_cat.name}: {ex}")
+            if catalogo:
+                st.dataframe(pd.DataFrame(catalogo)[["item", "descripcion", "unidad", "rend", "disciplina"]],
+                             hide_index=True, use_container_width=True, height=250,
+                             column_config={"item": "Ítem", "descripcion": "Descripción", "unidad": "Unidad",
+                                            "rend": st.column_config.NumberColumn("Rend. HH/u", format="%.4f"),
+                                            "disciplina": "Disciplina"})
+    
+        # 2. planilla
+        st.subheader("2 · Cubicación")
+        pdf = st.session_state.get("cp_pdf")
+        lado = False
+        if pdf:
+            lado = st.toggle("Plano al lado de la planilla", value=False, key="cp_lado",
+                             help="Apagado: el plano arriba y la planilla abajo, a todo el ancho.")
+        if pdf and lado:
+            izq, der = st.columns([1, 1.25])
+            with izq:
+                _visor(pdf)
+            with der:
+                filas = _editor(disc, catalogo)
+        else:
+            if pdf:
+                with st.expander(f"📄 {st.session_state.get('cp_pdf_nombre', 'Plano')}", expanded=True):
+                    _visor(pdf)
+            filas = _editor(disc, catalogo)
+    
+        calc = P.calcular(disc, filas, catalogo, contexto=f"{desc} {plano}")
+        _resultado(cid, disc, filas, calc, {"plano": plano, "rev": rev, "area": area, "descripcion": desc}, catalogo)
+        st.divider()
+        _guardadas(cid)
+    
+    
+    # ------------------------------------------------------------------ lectura automática
+    
+    def _lectura_automatica(cid, disc):
+        pdf = st.session_state["cp_pdf"]
+        with st.container(border=True):
+            if disc != "Piping":
+                st.caption("🤖 La lectura automática está disponible para **isométricos de piping** (tablas CUT PIPE "
+                           "LENGTHS, BILL OF MATERIALS, VALVES y PIPE SUPPORTS). Para esta disciplina digita los "
+                           "elementos en la planilla de abajo.")
+                return
+            st.markdown("**🤖 Cubicación automática del isométrico**")
+            a, b = st.columns([2, 1])
+            a.caption("La app lee las tablas de todas las láminas (cortes, válvulas, soportes y materiales), arma la "
+                      "planilla y revisa que los cortes de cada diámetro sumen lo que dice el BOM. Sin internet ni OCR: "
+                      "reconoce las letras de la fuente del plano.")
+            peso = b.number_input("Peso por soporte (kg)", min_value=0.0, step=1.0, key="cp_peso_sop",
+                                  value=float(db.config(cid, "peso_soporte_kg", 113.0) or 0),
+                                  help="Los soportes se pagan por kg. La planilla de piping usa 113 kg para S608CB6-24\".")
+            if st.button("🤖 Leer isométrico y cubicar", type="primary", key="btn_cp_auto"):
+                barra = st.progress(0.0, text="Leyendo láminas…")
+                try:
+                    lec = LP.leer_isometrico(pdf, lambda i, n: barra.progress(i / max(n, 1), text=f"Lámina {i + 1} de {n}…"))
+                except Exception as ex:
+                    barra.empty()
+                    st.error(f"No se pudo leer el plano: {ex}")
+                    return
+                barra.empty()
+                filas = LP.a_planilla(lec, peso or None)
+                if peso:
+                    db.guardar_config(cid, "peso_soporte_kg", float(peso))
+                st.session_state["cp_lectura"] = {
+                    "paginas": lec.paginas, "filas": len(filas), "avisos": lec.avisos,
+                    "dudosas": sum(1 for f in filas if f.get("Observación")),
+                    "cortes": sum(1 for f in filas if f["Tipo"] == "Cañería"),
+                    "metros": sum((f.get("Largo (mm)") or 0) / 1000 for f in filas if f["Tipo"] == "Cañería"),
+                    "valvulas": sum(f.get("Cantidad") or 0 for f in filas if f["Tipo"] == "Válvula"),
+                    "soportes": sum(f.get("Cantidad") or 0 for f in filas if f["Tipo"] == "Soporte")}
+                if not filas:
+                    st.warning("No encontré tablas de isométrico en este PDF. Digita los elementos en la planilla.")
+                    return
+                st.session_state["cp_pendiente"] = {"meta": {"disciplina": "Piping"}, "filas": filas}
+                st.rerun()
+            r = st.session_state.get("cp_lectura")
+            if r:
+                msg = (f"Leí {r['paginas']} lámina(s): {r['cortes']} cortes de cañería ({c.num(r['metros'], 3)} m), "
+                       f"{c.num(r['valvulas'])} válvulas, {c.num(r['soportes'])} soportes y el resto de los materiales. "
+                       f"La planilla de abajo quedó llena: revísala y guarda.")
+                (st.warning if r["avisos"] or r["dudosas"] else st.success)(msg)
+                for av in r["avisos"]:
+                    st.warning("⚠️ " + av)
+                if r["dudosas"]:
+                    st.info(f"{r['dudosas']} fila(s) tienen letras que no reconocí con seguridad: están marcadas con "
+                            f"«revisar lectura» en la columna Observación.")
+                elif not r["avisos"]:
+                    st.caption("✅ En todas las láminas los cortes de cada diámetro cuadran con la cañería del BOM.")
+    
+    
+    # ------------------------------------------------------------------ estado
+    
+    def _aplicar_pendiente():
+        """Valores para los widgets (al abrir una cubicación o subir un PDF) antes de dibujarlos."""
+        pend = st.session_state.pop("cp_pendiente", None)
+        if not pend:
+            return
+        meta = pend.get("meta", {})
+        for k, campo in zip(_WIDGETS_META, ("disciplina", "plano", "rev", "area", "descripcion")):
+            if campo in meta and meta[campo] is not None:
+                if k == "cp_disc" and meta[campo] not in P.DISCIPLINAS:
+                    continue
+                st.session_state[k] = meta[campo]
+        if "filas" in pend:
+            disc = meta.get("disciplina") or st.session_state.get("cp_disc") or P.DISCIPLINAS[0]
+            st.session_state[f"cp_base_{disc}"] = _df(disc, pend["filas"])
+            st.session_state["cp_ver"] = st.session_state.get("cp_ver", 0) + 1
+    
+    
+    def _catalogo(cid) -> list[dict]:
+        cat = db.config(cid, "catalogo_ec002", None)
+        if cat:
+            return cat
+        # sin catálogo propio: lo que haya en las planillas de avance guardadas (ítems controlados)
+        cargas = db.cargas_cubicacion(cid)
+        items = []
+        for r in cargas.itertuples():
+            d = db.carga_cubicacion(int(r.id)) or {}
+            items += [{"item": i["item"], "descripcion": i["descripcion"], "unidad": i["unidad"], "rend": i["rend"],
+                       "contrato": i["contrato"], "disciplina": i["disciplina"]} for i in d.get("items", [])]
+        return P.unir_catalogos(items)
+    
+    
+    def _df(disc: str, filas: list[dict] | None = None) -> pd.DataFrame:
+        cols = P.columnas(disc)
+        filas = filas or [P.fila_vacia(disc) for _ in range(8)]
+        df = pd.DataFrame([{n: f.get(n) for n, _, _ in cols} for f in filas], columns=[n for n, _, _ in cols])
+        for n, t, _ in cols:
+            df[n] = pd.to_numeric(df[n], errors="coerce") if t == "num" else df[n].fillna("").astype(str)
+        return df
+    
+    
+    def _opciones_item(disc: str, catalogo: list[dict]) -> list[str]:
+        sel = [x for x in catalogo if x["disciplina"] == disc or (disc == "Piping" and x["item"][:2] in ("51", "52", "53"))]
+        return [""] + [f"{x['item']} · {x['descripcion'][:70]}" for x in sel]
+    
+    
+    def _editor(disc: str, catalogo: list[dict]) -> list[dict]:
+        base_k = f"cp_base_{disc}"
+        if base_k not in st.session_state:
+            st.session_state[base_k] = _df(disc)
+        base = st.session_state[base_k]
+        opciones = _opciones_item(disc, catalogo)
+        for v in base["Ítem EC-002"].unique():            # ítems guardados que ya no están en el catálogo
+            if v and v not in opciones:
+                opciones.append(v)
+        conf = {}
+        for n, t, ayuda in P.columnas(disc):
+            if t == "num":
+                conf[n] = st.column_config.NumberColumn(n, help=ayuda or None, min_value=0.0, format="%.3f")
+            elif t == "tipo":
+                conf[n] = st.column_config.SelectboxColumn(n, help=ayuda or None, options=list(P.TIPOS[disc]),
+                                                           required=False, width="medium")
+            elif t == "item":
+                conf[n] = st.column_config.SelectboxColumn(n, help=ayuda or None, options=opciones, width="large")
+            else:
+                conf[n] = st.column_config.TextColumn(n, help=ayuda or None)
+        st.caption("Agrega filas con el **+** al final de la tabla. Puedes pegar desde Excel (Ctrl+V) varias filas a la vez. "
+                   + {"Piping": "En cañería, una fila por corte (tabla CUT PIPE LENGTHS, en mm).",
+                      "Obras civiles": "Dimensiones en metros: la cantidad sale en m³, m² o kg según el tipo.",
+                      "Estructura": "El peso sale de kg c/u, o de largo × kg/m.",
+                      "Mecánica": "Una fila por equipo o TAG.",
+                      "Eléctricos": "Cables, escalerillas y conduit en metros; equipos y luminarias por unidad."}[disc])
+        ed = st.data_editor(base, key=f"cp_ed_{disc}_{st.session_state.get('cp_ver', 0)}", num_rows="dynamic",
+                            hide_index=True, use_container_width=True, column_config=conf,
+                            height=min(560, 38 + 35 * (len(base) + 2)))
+        a, b, _ = st.columns([1, 1, 3])
+        if a.button("➕ 10 filas más", key="cp_mas"):
+            st.session_state[base_k] = pd.concat([ed, _df(disc, [P.fila_vacia(disc) for _ in range(10)])],
+                                                 ignore_index=True)
+            st.session_state["cp_ver"] = st.session_state.get("cp_ver", 0) + 1
+            st.rerun()
+        if b.button("🧹 Empezar de nuevo", key="cp_limpiar"):
+            st.session_state[base_k] = _df(disc)
+            st.session_state["cp_ver"] = st.session_state.get("cp_ver", 0) + 1
+            st.rerun()
+        return [{k: (None if isinstance(v, float) and v != v else v) for k, v in r.items()}
+                for r in ed.to_dict("records")]
+    
+    
+    @st.cache_data(show_spinner="Dibujando el plano…", max_entries=30)
+    def _png(pdf: bytes, pagina: int, dpi: int) -> bytes:
+        return P.imagen_pagina(pdf, pagina, dpi)
+    
+    
+    @st.cache_data(max_entries=10)
+    def _n_paginas(pdf: bytes) -> int:
+        return P.paginas_pdf(pdf)
+    
+    
+    def _visor(pdf: bytes):
+        try:
+            n = _n_paginas(pdf)
+        except Exception as ex:
+            st.error(f"No se pudo abrir el PDF: {ex}")
+            return
+        a, b = st.columns([1, 1])
+        pag = a.number_input(f"Lámina / página (de {n})", min_value=1, max_value=n, value=1, step=1, key="cp_pag") \
+            if n > 1 else 1
+        dpi = b.select_slider("Nitidez", options=[90, 120, 160, 200], value=120, key="cp_dpi",
+                              help="Más nitidez = más lento. Usa 160–200 para leer tablas chicas.")
+        try:
+            st.image(_png(pdf, int(pag) - 1, int(dpi)), use_container_width=True)
+        except Exception as ex:
+            st.error(f"No se pudo dibujar la página: {ex}")
+    
+    
+    # ------------------------------------------------------------------ resultado
+    
+    def _resultado(cid, disc, filas, calc, meta, catalogo):
+        if not calc:
+            st.info("Digita al menos una fila para ver la cubicación.")
+            return
+        res = P.resumen_items(calc)
+        hh = sum(f.hh for f in calc)
+        por_u = {}
+        for f in calc:
+            por_u[f.unidad] = por_u.get(f.unidad, 0) + f.cantidad
+        k = st.columns(4)
+        k[0].metric("Filas", len(calc))
+        k[1].metric("Ítems EC-002", len({f.item for f in calc if f.item}))
+        k[2].metric("HH", c.num(hh, 1))
+        k[3].metric("Cantidades", " · ".join(f"{c.num(v, 2)} {u}" for u, v in por_u.items() if u) or "—")
+        avisos = [f for f in calc if f.aviso]
+        t1, t2, t3 = st.tabs(["Resumen por ítem", f"Filas calculadas{' ⚠️' if avisos else ''}", "Comparar"])
+        with t1:
+            st.dataframe(pd.DataFrame(res), hide_index=True, use_container_width=True,
+                         column_config={"Cantidad": st.column_config.NumberColumn(format="%.3f"),
+                                        "Rend. HH/u": st.column_config.NumberColumn(format="%.4f"),
+                                        "HH": st.column_config.NumberColumn(format="%.1f"),
+                                        "Descripción ítem": st.column_config.TextColumn(width="large")})
+        with t2:
+            if avisos:
+                st.warning(f"{len(avisos)} fila(s) con avisos: revisa la columna «Aviso». Los ítems marcados ✳ los "
+                           f"propuso la app; si no corresponden, elígelos en la columna «Ítem EC-002» de la planilla.")
+            st.dataframe(pd.DataFrame([{"N°": f.n, "Lámina": f.lamina, "Tipo": f.tipo, "Descripción": f.descripcion,
+                                        "Cantidad": f.cantidad, "Unidad": f.unidad,
+                                        "Ítem EC-002": (f.item + " ✳") if f.item_sugerido else f.item,
+                                        "Descripción ítem": f.item_desc, "Rend.": f.rend, "HH": f.hh, "Aviso": f.aviso}
+                                       for f in calc]), hide_index=True, use_container_width=True,
+                         column_config={"Cantidad": st.column_config.NumberColumn(format="%.3f"),
+                                        "HH": st.column_config.NumberColumn(format="%.1f"),
+                                        "Rend.": st.column_config.NumberColumn(format="%.4f")})
+        comparacion = None
+        with t3:
+            comparacion = _comparar(cid, meta, res)
+        a, b = st.columns(2)
+        if a.button("💾 Guardar cubicación", type="primary", key="btn_cp_guardar", disabled=not meta["plano"].strip()):
+            if c.exigir("cargar"):
+                datos = {"meta": {**meta, "disciplina": disc}, "disciplina": disc, "filas": filas,
+                         "resumen": res, "calc": [asdict(f) for f in calc]}
+                db.guardar_cub_plano(meta["plano"].strip(), meta["rev"].strip(), disc, meta["descripcion"], datos, hh,
+                                     c.nombre_usuario(), contrato_id=cid)
+                st.success(f"Cubicación de {meta['plano']} Rev. {meta['rev'] or '—'} guardada.")
+        if not meta["plano"].strip():
+            a.caption("Escribe el N° de plano para guardar.")
+        meta_x = {**meta, "usuario": c.nombre_usuario(), "fecha": dt.date.today().strftime("%d-%m-%Y")}
+        b.download_button("⬇️ Exportar cubicación (Excel)", P.excel(meta_x, disc, filas, calc, comparacion),
+                          file_name=f"Cubicacion_{(meta['plano'] or 'plano').strip()}"
+                                    f"{'_Rev' + meta['rev'].strip() if meta['rev'].strip() else ''}.xlsx",
+                          mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_cp")
+    
+    
+    def _comparar(cid, meta, res) -> list[dict] | None:
+        plano = meta["plano"].strip()
+        if not plano:
+            st.caption("Escribe el N° de plano para comparar con otras revisiones o con la planilla de avance.")
+            return None
+        out = None
+        guardadas = db.cub_planos(cid)
+        otras = guardadas[(guardadas["plano"].map(C.norm) == C.norm(plano)) &
+                          (guardadas["rev"].fillna("").map(C.norm) != C.norm(meta["rev"]))]
+        st.markdown("**Contra otra revisión guardada del mismo plano**")
+        if otras.empty:
+            st.caption("No hay otra revisión de este plano guardada.")
+        else:
+            etiquetas = {int(r.id): f"Rev. {r.rev or '—'} · {str(r.creado_en)[:10]}" for r in otras.itertuples()}
+            sel = st.selectbox("Revisión", list(etiquetas), format_func=etiquetas.get, key="cp_cmp_rev")
+            ant = (db.cub_plano(int(sel)) or {}).get("resumen", [])
+            out = P.comparar(res, ant)
+            _tabla_cmp(pd.DataFrame(out).rename(columns={"Anterior": f"{etiquetas[int(sel)].split(' · ')[0]}",
+                                                         "Nueva": f"Rev. {meta['rev'] or 'actual'}"}))
+        st.markdown("**Contra la planilla de avance**")
+        cargas = db.cargas_cubicacion(cid)
+        if cargas.empty:
+            st.caption("No hay planillas de avance cargadas.")
+            return out
+        fecha = cargas["fecha"].max()
+        filas = []
+        for r in cargas[cargas["fecha"] == fecha].itertuples():
+            d = db.carga_cubicacion(int(r.id)) or {}
+            filas += [f for f in d.get("detalle", []) if C.norm(f.get("plano")) == C.norm(plano)]
+        if not filas:
+            st.caption(f"La planilla de avance del {c.fecha(fecha)} no tiene filas con el plano {plano}.")
+            return out
+        plan: dict[str, float] = {}
+        for f in filas:
+            plan[f["item"]] = plan.get(f["item"], 0) + float(f.get("cantidad") or 0)
+        nuevo = {}
+        for d in res:
+            nuevo[d["Ítem"]] = nuevo.get(d["Ítem"], 0) + d["Cantidad"]
+        rend = {d["Ítem"]: d["Rend. HH/u"] for d in res}
+        df = pd.DataFrame([{"Ítem": i, "Planilla": plan.get(i, 0.0), "Plano": nuevo.get(i, 0.0),
+                            "Diferencia": nuevo.get(i, 0.0) - plan.get(i, 0.0),
+                            "Diferencia HH": (nuevo.get(i, 0.0) - plan.get(i, 0.0)) * rend.get(i, 0.0)}
+                           for i in sorted(set(plan) | set(nuevo))])
+        st.caption(f"Planilla de avance del {c.fecha(fecha)}: {len(filas)} filas con este plano. «Planilla» es la "
+                   f"cubicación de esas filas; la diferencia positiva es cantidad que falta en la planilla.")
+        _tabla_cmp(df)
+        return out
+    
+    
+    def _tabla_cmp(df: pd.DataFrame):
+        st.dataframe(df, hide_index=True, use_container_width=True,
+                     column_config={k: st.column_config.NumberColumn(format="%.3f") for k in df.columns
+                                    if k not in ("Ítem", "Unidad", "Diferencia HH")}
+                     | {"Diferencia HH": st.column_config.NumberColumn(format="%.1f")})
+    
+    
+    # ------------------------------------------------------------------ guardadas
+    
+    def _guardadas(cid):
+        st.subheader("Cubicaciones guardadas")
+        g = db.cub_planos(cid)
+        if g.empty:
+            st.caption("Ninguna todavía. Las que guardes quedan aquí para abrirlas, compararlas o exportarlas.")
+            return
+        st.dataframe(g.assign(creado_en=g["creado_en"].astype(str).str[:16]).drop(columns="id"), hide_index=True,
+                     use_container_width=True,
+                     column_config={"plano": "N° plano", "rev": "Rev.", "disciplina": "Disciplina",
+                                    "descripcion": "Descripción", "hh": st.column_config.NumberColumn("HH", format="%.1f"),
+                                    "creado_por": "Cubicó", "creado_en": "Guardada"})
+        etiquetas = {int(r.id): f"{r.plano} · Rev. {r.rev or '—'} ({r.disciplina})" for r in g.itertuples()}
+        a, b, d = st.columns([3, 1, 1])
+        sel = a.selectbox("Cubicación", list(etiquetas), format_func=etiquetas.get, key="cp_sel")
+        if b.button("📂 Abrir", key="btn_cp_abrir"):
+            datos = db.cub_plano(int(sel)) or {}
+            st.session_state["cp_pendiente"] = {"meta": datos.get("meta", {}), "filas": datos.get("filas", [])}
+            st.rerun()
+        if d.button("🗑️ Eliminar", key="btn_cp_borrar") and c.exigir("cargar"):
+            db.borrar_cub_plano(int(sel), contrato_id=cid)
+            st.rerun()
+        # consolidado de todas
+        filas, items = [], []
+        for r in g.itertuples():
+            datos = db.cub_plano(int(r.id)) or {}
+            for x in datos.get("resumen", []):
+                items.append({"Plano": r.plano, "Rev": r.rev, "Disciplina": r.disciplina, **x})
+            for x in datos.get("calc", []):
+                filas.append({"Plano": r.plano, "Rev": r.rev, "Disciplina": r.disciplina, "Lámina": x["lamina"],
+                              "Tipo": x["tipo"], "Descripción": x["descripcion"], "Cantidad": x["cantidad"],
+                              "Unidad": x["unidad"], "Ítem EC-002": x["item"], "Rend.": x["rend"], "HH": x["hh"]})
+        df_items = pd.DataFrame(items)
+        tot = (df_items.groupby(["Disciplina", "Ítem", "Descripción ítem", "Unidad"], dropna=False)
+               .agg(Cantidad=("Cantidad", "sum"), HH=("HH", "sum"), Planos=("Plano", "nunique")).reset_index()
+               if not df_items.empty else df_items)
+        st.download_button("⬇️ Exportar todas las cubicaciones (Excel)",
+                           C.excel_tablas({"Total por ítem": tot, "Por plano e ítem": df_items, "Filas": pd.DataFrame(filas)},
+                                          "Cubicación desde planos"),
+                           file_name=f"Cubicaciones_planos_{dt.date.today().strftime('%d-%m-%Y')}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_cp_todas")
+
+    return SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
+
+
+vcubicar = _modulo_vcubicar()
+
+# ======================================================================
+# MÓDULO: vcubicacion
+# ======================================================================
+def _modulo_vcubicacion():
+    import datetime as dt
+    
+    import pandas as pd
+    import plotly.graph_objects as go
+    import streamlit as st
+    
+    C = cubicacion
+    CP = cubicar_plano
+    c = comun
+    VCP = vcubicar
+    
+    ICONOS = {"Obras civiles": "🧱", "Estructura": "🏗️", "Mecánica": "⚙️", "Piping": "🔧", "Eléctricos": "⚡", "Otras": "📦"}
+    NAVY, NARANJO, GRIS = "#06205C", "#FA4D09", "#C9D2E3"
+    
+    
+    def vista():
+        st.title("Cubicación por disciplina")
+        st.caption("**Cubica un plano nuevo** (pestaña 📝) o carga cada semana las **planillas de avance** de cada especialidad (civil, mecánica y estructuras, "
+                   "piping, eléctrica). La app lee su itemizado EC-002 y sus hojas de control, calcula el avance por "
+                   "disciplina en HH ganadas y revisa errores típicos. Lo cargado aquí también alimenta el itemizado del "
+                   "informe semanal.")
+        cid = c.contrato_id()
+        cargas = db.cargas_cubicacion(cid)
+        t_plano, t_av, t_rev, t_det, t_carga = st.tabs(["📝 Cubicar desde plano", "📊 Avance por disciplina",
+                                                        "🔎 Revisión de planillas", "📐 Detalle por plano",
+                                                        "📥 Cargar planillas"])
+        with t_plano:
+            VCP.seccion()
+        with t_carga:
+            if c.exigir("cargar"):
+                _cargar(cid, cargas)
+        if cargas.empty:
+            for t in (t_av, t_rev, t_det):
+                with t:
+                    st.info("Aún no hay planillas cargadas. Súbelas en la pestaña **📥 Cargar planillas**.")
+            return
+        fechas = sorted(cargas["fecha"].unique(), reverse=True)
+        with t_av:
+            fecha = st.selectbox("Semana al", fechas, format_func=c.fecha, key="cub_fecha")
+        planillas = _planillas(cid, cargas, fecha)
+        previas = [f for f in fechas if f < fecha]
+        previo = _acumulados(cid, cargas, previas[0]) if previas else {}
+        items = _con_anterior(C.consolidar(planillas), previo)
+        with t_av:
+            _avance(planillas, items, fecha, previas[0] if previas else None)
+        with t_rev:
+            _revision(planillas, items)
+        with t_det:
+            _detalle(planillas)
+    
+    
+    # ------------------------------------------------------------------ datos
+    
+    @st.cache_data(show_spinner="Leyendo planilla guardada…", max_entries=40)
+    def _carga(carga_id: int) -> dict | None:
+        return db.carga_cubicacion(carga_id)
+    
+    
+    def _planillas(cid, cargas: pd.DataFrame, fecha: str) -> list[C.PlanillaCub]:
+        out = []
+        for r in cargas[cargas["fecha"] == fecha].sort_values("id").itertuples():
+            d = _carga(int(r.id))
+            if d:
+                out.append(C.PlanillaCub.de_dict(d))
+        return out
+    
+    
+    def _acumulados(cid, cargas, fecha) -> dict[str, float]:
+        return {k: it.acumulado for k, it in C.consolidar(_planillas(cid, cargas, fecha)).items()}
+    
+    
+    def _con_anterior(items: dict[str, C.ItemCub], previo: dict[str, float]) -> dict[str, C.ItemCub]:
+        """Si la planilla no trae «avance anterior», se usa el acumulado de la carga anterior guardada en la app."""
+        import dataclasses
+        out = {}
+        for k, it in items.items():
+            if abs(it.anterior) < 1e-9 and k in previo:
+                it = dataclasses.replace(it, anterior=previo[k])
+            out[k] = it
+        return out
+    
+    
+    # ------------------------------------------------------------------ cargar
+    
+    def _cargar(cid, cargas):
+        st.markdown("Sube una o varias planillas de avance de la **misma semana**. De cada archivo se guarda lo leído "
+                    "(ítems, detalle y revisión), no el Excel completo.")
+        archivos = st.file_uploader("Planillas de avance (.xlsx)", type=["xlsx", "xlsm"], accept_multiple_files=True,
+                                    key="up_cub")
+        detectadas = sorted({C.fecha_de_nombre(a.name) for a in archivos or [] if C.fecha_de_nombre(a.name)})
+        defecto = dt.datetime.strptime(detectadas[-1], "%d-%m-%Y").date() if detectadas else _viernes_anterior()
+        fecha = st.date_input("Fecha de corte (último día de la semana)", value=defecto, format="DD-MM-YYYY",
+                              key="cub_fecha_carga")
+        if len(detectadas) > 1:
+            st.warning(f"Los nombres de los archivos traen fechas distintas ({', '.join(detectadas)}). Se guardarán "
+                       f"todos con la fecha de corte elegida.")
+        for tipo, m in st.session_state.pop("cub_msgs", []):
+            (st.success if tipo == "ok" else st.error)(m)
+        if archivos and st.button(f"Leer y guardar {len(archivos)} planilla(s)", type="primary", key="btn_cub"):
+            ok, msgs = 0, []
+            for a in archivos:
+                try:
+                    with st.spinner(f"Leyendo {a.name}…"):
+                        p = C.leer_planilla(a.getvalue(), a.name)
+                    try:                         # el itemizado completo queda como catálogo EC-002 del contrato
+                        db.guardar_config(cid, "catalogo_ec002", CP.unir_catalogos(
+                            db.config(cid, "catalogo_ec002", []), CP.catalogo_de_planilla(a.getvalue())))
+                    except Exception:
+                        pass
+                    db.guardar_carga_cubicacion(fecha.isoformat(), a.name, ", ".join(p.disciplinas), p.a_dict(),
+                                                c.nombre_usuario(), contrato_id=cid)
+                    ok += 1
+                    msgs.append(("ok", f"✅ {a.name}: {len(p.items)} ítems ({', '.join(p.disciplinas)}), "
+                                       f"{len(p.detalle)} filas de detalle, {len(p.hallazgos)} observaciones."))
+                except Exception as e:
+                    msgs.append(("error", f"{a.name}: {e}"))
+            st.session_state["cub_msgs"] = msgs
+            if ok:
+                c.limpiar_cache()
+                st.session_state["cub_fecha"] = fecha.isoformat()
+            st.rerun()
+        st.divider()
+        st.markdown("**Planillas guardadas**")
+        if cargas.empty:
+            st.caption("Ninguna todavía.")
+            return
+        vista = cargas.assign(fecha=cargas["fecha"].map(c.fecha), creado_en=cargas["creado_en"].astype(str).str[:16])
+        st.dataframe(vista[["fecha", "archivo", "disciplinas", "creado_por", "creado_en"]], hide_index=True,
+                     use_container_width=True,
+                     column_config={"fecha": "Semana al", "archivo": "Archivo", "disciplinas": "Disciplinas",
+                                    "creado_por": "Cargó", "creado_en": "Fecha de carga"})
+        etiquetas = {int(r.id): f"{c.fecha(r.fecha)} · {r.archivo}" for r in cargas.itertuples()}
+        a, b = st.columns([3, 1])
+        sel = a.selectbox("Eliminar una carga", list(etiquetas), format_func=etiquetas.get, key="cub_borrar_sel")
+        if b.button("Eliminar", key="btn_cub_borrar"):
+            db.borrar_carga_cubicacion(int(sel), contrato_id=cid)
+            c.limpiar_cache()
+            st.rerun()
+    
+    
+    def _viernes_anterior() -> dt.date:
+        hoy = dt.date.today()
+        return hoy - dt.timedelta(days=(hoy.weekday() - 4) % 7)
+    
+    
+    # ------------------------------------------------------------------ avance
+    
+    def _avance(planillas, items, fecha, fecha_prev):
+        res = {r["disciplina"]: r for r in C.resumen_disciplinas(items)}
+        con_planilla = {d for p in planillas for d in p.disciplinas}
+        tot_pom = sum(r["hh_pom"] for r in res.values())
+        tot_gan = sum(r["hh_ganadas"] for r in res.values())
+        tot_sem = sum(r["hh_semana"] for r in res.values())
+        k = st.columns(4)
+        k[0].metric("HH POM (cubicadas)", c.num(tot_pom))
+        k[1].metric("HH ganadas acumuladas", c.num(tot_gan))
+        k[2].metric("Avance físico (HH)", c.porc(100 * tot_gan / tot_pom if tot_pom else 0, 1))
+        k[3].metric("HH ganadas en la semana", c.num(tot_sem))
+        st.caption(f"Planillas de la semana al {c.fecha(fecha)}: " + " · ".join(p.archivo for p in planillas)
+                   + (f". El avance de la semana se mide contra la carga del {c.fecha(fecha_prev)} cuando la planilla no "
+                      f"trae avance anterior." if fecha_prev else "."))
+    
+        sin_ant = sorted({h.disciplina for p in planillas for h in p.hallazgos if h.tipo == "Planilla sin avance anterior"})
+        if sin_ant and not fecha_prev:
+            st.warning(f"La planilla de {', '.join(sin_ant)} no trae «avance anterior» y no hay una carga de la semana "
+                       f"previa en la app: sus HH de la semana muestran todo el acumulado. Desde la próxima carga se "
+                       f"calculan contra esta.")
+        filas = []
+        for d in C.DISCIPLINAS + [C.OTRAS]:
+            r = res.get(d)
+            if d == C.OTRAS and (not r or not r["items"]):
+                continue
+            if not r or d not in con_planilla:
+                filas.append({"Disciplina": f"{ICONOS[d]} {d}", "Estado": "Sin planilla cargada", "Ítems": 0,
+                              "HH POM": None, "HH ganadas": None, "HH semana": None, "Avance": None, "Avance anterior": None})
+                continue
+            filas.append({"Disciplina": f"{ICONOS[d]} {d}", "Estado": "Cargada", "Ítems": r["items"], "HH POM": r["hh_pom"],
+                          "HH ganadas": r["hh_ganadas"], "HH semana": r["hh_semana"], "Avance": 100 * r["avance"],
+                          "Avance anterior": 100 * r["avance_anterior"]})
+        df = pd.DataFrame(filas)
+        st.dataframe(df, hide_index=True, use_container_width=True, column_config={
+            "HH POM": st.column_config.NumberColumn(format="%.0f"),
+            "HH ganadas": st.column_config.NumberColumn(format="%.0f"),
+            "HH semana": st.column_config.NumberColumn(format="%.0f"),
+            "Avance": st.column_config.ProgressColumn("Avance (HH)", format="%.1f%%", min_value=0, max_value=100),
+            "Avance anterior": st.column_config.ProgressColumn("Semana anterior", format="%.1f%%", min_value=0,
+                                                               max_value=100)})
+        g = df.dropna(subset=["Avance"])
+        if not g.empty:
+            fig = go.Figure()
+            fig.add_bar(y=g["Disciplina"], x=g["Avance anterior"], name="Semana anterior", orientation="h",
+                        marker_color=GRIS)
+            fig.add_bar(y=g["Disciplina"], x=g["Avance"], name="Acumulado", orientation="h", marker_color=NAVY,
+                        text=[f"{v:.1f}%" for v in g["Avance"]], textposition="outside")
+            fig.update_layout(barmode="group", xaxis=dict(range=[0, 110], ticksuffix="%"), yaxis=dict(autorange="reversed"),
+                              title="Avance físico por disciplina (HH ganadas / HH POM)")
+            st.plotly_chart(c.layout_grafico(fig, 300 + 30 * len(g)), use_container_width=True)
+        st.download_button("⬇️ Descargar consolidado (Excel)", C.excel_resumen(planillas, c.fecha(fecha)),
+                           file_name=f"Cubicacion_por_disciplina_{c.fecha(fecha)}.xlsx", key="dl_cub",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    
+        st.subheader("Ítems de una disciplina")
+        disponibles = [d for d in C.DISCIPLINAS + [C.OTRAS] if any(i.disciplina == d for i in items.values())]
+        a, b, f = st.columns([1.2, 2, 1])
+        disc = a.selectbox("Disciplina", disponibles, format_func=lambda d: f"{ICONOS[d]} {d}", key="cub_disc")
+        buscar = b.text_input("Buscar ítem o descripción", key="cub_buscar")
+        solo = f.checkbox("Solo con avance en la semana", key="cub_solo")
+        sel = [i for i in items.values() if i.disciplina == disc]
+        if buscar:
+            q = C.norm(buscar)
+            sel = [i for i in sel if q in C.norm(i.item) or q in C.norm(i.descripcion)]
+        if solo:
+            sel = [i for i in sel if i.semana > 1e-6]
+        tabla = pd.DataFrame([{"Ítem": i.item, "Descripción": i.descripcion, "Un.": i.unidad, "Contrato": i.contrato,
+                               "POM": i.pom, "Anterior": i.anterior, "Acumulado": i.acumulado, "Semana": i.semana,
+                               "Avance": 100 * i.acumulado / i.pom_valida if i.pom_valida else 0,
+                               "HH ganadas": i.hh_ganadas, "Planilla de control": i.hoja_control}
+                              for i in sorted(sel, key=lambda x: x.item)])
+        if tabla.empty:
+            st.caption("Sin ítems para el filtro.")
+            return
+        st.dataframe(tabla, hide_index=True, use_container_width=True, height=min(600, 38 + 35 * len(tabla)),
+                     column_config={**{k: st.column_config.NumberColumn(format="%.2f")
+                                       for k in ("Contrato", "POM", "Anterior", "Acumulado", "Semana")},
+                                    "HH ganadas": st.column_config.NumberColumn(format="%.0f"),
+                                    "Descripción": st.column_config.TextColumn(width="large"),
+                                    "Avance": st.column_config.ProgressColumn("% avance", format="%.0f%%", min_value=0,
+                                                                              max_value=100)})
+    
+    
+    # ------------------------------------------------------------------ revisión
+    
+    def _revision(planillas, items):
+        hall = [h for p in planillas for h in p.hallazgos] + C.cruzar(planillas)
+        if not hall:
+            st.success("Sin observaciones en las planillas de esta semana.")
+            return
+        n = {g: sum(1 for h in hall if h.gravedad == g) for g in ("Error", "Revisar", "Info")}
+        k = st.columns(3)
+        k[0].metric("🔴 Errores", n["Error"], help="Avance sobre la cubicación, retrocesos, detalle que no cuadra…")
+        k[1].metric("🟠 Para revisar", n["Revisar"], help="TAG repetidos, filas sin plano, ítems sin rendimiento…")
+        k[2].metric("ℹ️ Informativas", n["Info"], help="Mayor obra: cubicación POM más de 10 % sobre el contrato.")
+        a, b = st.columns(2)
+        discs = sorted({h.disciplina for h in hall}, key=lambda d: (C.DISCIPLINAS + [C.OTRAS]).index(d)
+                       if d in C.DISCIPLINAS + [C.OTRAS] else 9)
+        f_disc = a.multiselect("Disciplina", discs, default=discs, key="cub_rev_disc")
+        f_grav = b.multiselect("Gravedad", ["Error", "Revisar", "Info"], default=["Error", "Revisar"], key="cub_rev_grav")
+        sel = [h for h in hall if h.disciplina in f_disc and h.gravedad in f_grav]
+        orden = {"Error": 0, "Revisar": 1, "Info": 2}
+        df = pd.DataFrame([{"Gravedad": {"Error": "🔴 Error", "Revisar": "🟠 Revisar", "Info": "ℹ️ Info"}[h.gravedad],
+                            "Disciplina": h.disciplina, "Tipo": h.tipo, "Ítem": h.item, "Detalle": h.detalle,
+                            "Planilla": h.planilla, "_o": orden[h.gravedad]} for h in sel])
+        if df.empty:
+            st.caption("Sin observaciones para el filtro.")
+            return
+        df = df.sort_values(["_o", "Disciplina", "Tipo", "Ítem"]).drop(columns="_o")
+        st.dataframe(df, hide_index=True, use_container_width=True, height=min(650, 38 + 35 * len(df)),
+                     column_config={"Detalle": st.column_config.TextColumn(width="large")})
+        resumen = df.groupby(["Disciplina", "Tipo"]).size().reset_index(name="Cantidad")
+        with st.expander("Resumen por tipo"):
+            st.dataframe(resumen, hide_index=True, use_container_width=True)
+    
+    
+    # ------------------------------------------------------------------ detalle
+    
+    def _detalle(planillas):
+        filas = []
+        for p in planillas:
+            for f in p.detalle:
+                it = p.items.get(f.item)
+                filas.append({"Disciplina": it.disciplina if it else C.disciplina_de("", f.item), "Hoja": f.hoja,
+                              "Fila": f.fila, "Ítem": f.item, "Plano": f.plano, "Rev": f.rev, "TAG": f.tag,
+                              "Descripción": f.descripcion, "Un.": f.unidad, "Cubicación": f.cantidad,
+                              "Acumulado": f.acumulado})
+        if not filas:
+            st.info("Las planillas cargadas no traen hojas de detalle legibles.")
+            return
+        df = pd.DataFrame(filas)
+        a, b, f = st.columns([1.2, 1.6, 2])
+        discs = [d for d in C.DISCIPLINAS + [C.OTRAS] if d in set(df["Disciplina"])]
+        disc = a.selectbox("Disciplina", discs, format_func=lambda d: f"{ICONOS[d]} {d}", key="cub_det_disc")
+        df = df[df["Disciplina"] == disc]
+        hoja = b.selectbox("Hoja de control", ["(todas)"] + list(dict.fromkeys(df["Hoja"])), key="cub_det_hoja")
+        if hoja != "(todas)":
+            df = df[df["Hoja"] == hoja]
+        q = f.text_input("Buscar plano, TAG, ítem o descripción", key="cub_det_buscar")
+        if q:
+            qn = C.norm(q)
+            df = df[df.apply(lambda r: any(qn in C.norm(r[k]) for k in ("Plano", "TAG", "Ítem", "Descripción")), axis=1)]
+        avisos = {h: a for p in planillas for h, a in p.hojas_detalle.items() if a}
+        if hoja in avisos or (hoja == "(todas)" and any(h in avisos for h in set(df["Hoja"]))):
+            st.caption("ℹ️ " + " · ".join(f"«{h}»: {a}" for h, a in avisos.items() if hoja in ("(todas)", h)
+                                          and h in set(df["Hoja"])))
+        por_plano = (df.assign(Plano=df["Plano"].replace("", "(sin plano)"))
+                     .groupby(["Plano", "Rev"], dropna=False)
+                     .agg(Filas=("Fila", "count"), Ítems=("Ítem", "nunique"), Cubicación=("Cubicación", "sum"),
+                          Acumulado=("Acumulado", "sum")).reset_index()
+                     .sort_values("Filas", ascending=False))
+        k = st.columns(3)
+        k[0].metric("Filas", len(df))
+        k[1].metric("Planos", int(por_plano.shape[0]))
+        k[2].metric("Ítems", int(df["Ítem"].nunique()))
+        plano_item = (df.assign(Plano=df["Plano"].replace("", "(sin plano)"))
+                      .groupby(["Plano", "Rev", "Ítem", "Un."], dropna=False)
+                      .agg(Filas=("Fila", "count"), Cubicación=("Cubicación", "sum"), Acumulado=("Acumulado", "sum"))
+                      .reset_index())
+        plano_item["% avance"] = (plano_item["Acumulado"] / plano_item["Cubicación"]).where(plano_item["Cubicación"] > 0)
+        st.download_button(
+            "⬇️ Exportar cubicación a Excel (filtro actual)",
+            C.excel_tablas({"Por plano": por_plano, "Por plano e ítem": plano_item, "Filas": df.drop(columns="Disciplina")},
+                           f"Cubicación {disc}" + (f" · {hoja}" if hoja != "(todas)" else "")),
+            file_name=f"Cubicacion_{C.norm(disc).replace(' ', '_')}{'_' + C.norm(hoja)[:25].replace(' ', '_') if hoja != '(todas)' else ''}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_cub_det")
+        st.markdown("**Por plano**")
+        st.dataframe(por_plano, hide_index=True, use_container_width=True, height=min(400, 38 + 35 * len(por_plano)),
+                     column_config={"Cubicación": st.column_config.NumberColumn(format="%.2f"),
+                                    "Acumulado": st.column_config.NumberColumn(format="%.2f")})
+        st.markdown("**Filas de la planilla**")
+        st.dataframe(df.drop(columns="Disciplina"), hide_index=True, use_container_width=True,
+                     height=min(600, 38 + 35 * len(df)),
+                     column_config={"Cubicación": st.column_config.NumberColumn(format="%.2f"),
+                                    "Acumulado": st.column_config.NumberColumn(format="%.2f"),
+                                    "Descripción": st.column_config.TextColumn(width="large")})
+
+    return SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
+
+
+vcubicacion = _modulo_vcubicacion()
+
+# ======================================================================
+# MÓDULO: vsemanal
+# ======================================================================
+def _modulo_vsemanal():
+    import datetime as dt
+    
+    import pandas as pd
+    import streamlit as st
+    
+    SM = semanal
+    CUB = cubicacion
+    c = comun
+    
+    MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    
+    
+    @st.cache_resource(show_spinner="Leyendo el informe semanal base…", max_entries=2)
+    def _plantilla(archivo_id: int):
+        return SM.leer_plantilla(db.archivo_semanal(archivo_id))
+    
+    
+    @st.cache_resource(show_spinner="Leyendo la BD Personal del último informe diario…", max_entries=2)
+    def _bd_personal(archivo_id: int):
+        return SM.leer_bd_personal(db.archivo_diario(archivo_id))
+    
+    
+    def _actividades_p6():
+        """Actividades del corte P6 más reciente del contrato (para la fecha real de los hitos)."""
+        pr = c.proyectos()
+        if pr is None or pr.empty:
+            return None
+        mejor = None
+        for _, p in pr.iterrows():
+            cts = c.cortes(int(p["id"]))
+            if cts is not None and not cts.empty:
+                u = cts.iloc[-1]
+                if mejor is None or str(u["fecha_corte"]) > str(mejor["fecha_corte"]):
+                    mejor = u
+        return c.actividades(int(mejor["id"])) if mejor is not None else None
+    
+    
+    def crear():
+        cid = c.contrato_id()
+        base = db.base_semanal_vigente(cid)
+        _planilla_base(base, cid)
+        if not base:
+            return
+        try:
+            pl = _plantilla(int(base["id"]))
+        except Exception as e:
+            st.error(f"No se pudo leer el informe base: {e}")
+            return
+        for a in pl.avisos:
+            st.warning(a)
+    
+        inicio = pl.inicio + dt.timedelta(days=7)
+        fin = inicio + dt.timedelta(days=6)
+        st.markdown(f"### Informe semanal N° {pl.numero + 1} · {c.fecha(inicio)} al {c.fecha(fin)}")
+    
+        # Datos de la semana desde el último informe diario
+        base_d = db.base_diario_vigente(cid)
+        sem, bd = None, None
+        if base_d:
+            try:
+                bd = _bd_personal(int(base_d["id"]))
+                sem = SM.calcular_semana(pl, bd, inicio)
+            except Exception as e:
+                st.error(f"No se pudo leer la BD Personal del informe diario: {e}")
+        if sem is None:
+            st.info("No hay informe diario base cargado: las HH y la dotación se ingresan a mano.")
+            sem = SM.Semana(inicio, fin, pl.numero + 1)
+        elif sem.dias_sin_datos:
+            st.warning("La BD Personal del último informe diario no tiene los días "
+                       + ", ".join(c.fecha(d) for d in sem.dias_sin_datos)
+                       + ". Genera los informes diarios que faltan o corrige las HH a mano.")
+    
+        clave = f"sem_{base['id']}_{inicio}"
+        if clave not in st.session_state:
+            st.session_state[clave] = SM.entradas_sugeridas(pl, sem, _actividades_p6())
+        ent: SM.EntradasSemanal = st.session_state[clave]
+    
+        tabs = st.tabs(["0. Portada", "1. Resumen ejecutivo", "2. Seguridad", "3. Curva de avance", "4.0 Dotación",
+                        "5. Curva dotación", "7. Itemizado (planillas de avance)", "✅ Revisar y generar"])
+        with tabs[0]:
+            _portada(ent)
+        with tabs[1]:
+            _resumen(pl, ent)
+        with tabs[2]:
+            _seguridad(pl, ent)
+        with tabs[3]:
+            _curva(pl, fin)
+        with tabs[4]:
+            _dotacion(pl, ent)
+        with tabs[5]:
+            _curva_dotacion(pl, ent)
+        with tabs[6]:
+            _itemizado(pl, ent, clave)
+        with tabs[7]:
+            _generar(base, pl, ent, sem, cid)
+    
+    
+    # ------------------------------------------------------------------ planilla base
+    
+    def _planilla_base(base, cid):
+        with st.expander("📄 Informe semanal base (el último emitido)", expanded=not base):
+            if base:
+                st.caption(f"Base vigente: **{base['nombre']}** · N° {base['numero']} · semana al {c.fecha(base['fecha'])} · "
+                           f"{'generado por el sistema' if base['tipo'] == 'generado' else 'cargado'} el {base['creado_en'][:16]}")
+                st.download_button("Descargar base", db.archivo_semanal(int(base["id"])), file_name=base["nombre"],
+                                   mime=MIME_XLSX, key="dl_base_sem")
+            archivo = st.file_uploader("Cargar o reemplazar el informe semanal base (.xlsx)", type=["xlsx", "xlsm"],
+                                       key="up_base_sem")
+            if archivo is not None:
+                try:
+                    pl = SM.leer_plantilla(archivo.getvalue())
+                except Exception as e:
+                    st.error(f"No se pudo leer el informe: {e}")
+                    return
+                st.success(f"Informe N° {pl.numero} · semana del {c.fecha(pl.inicio)} al {c.fecha(pl.fin)}.")
+                if st.button("Usar como base", type="primary", key="btn_base_sem"):
+                    db.guardar_base_semanal(archivo.name, pl.fin.isoformat(), pl.numero, archivo.getvalue(),
+                                            c.nombre_usuario(), "base", contrato_id=cid)
+                    st.cache_resource.clear()
+                    st.rerun()
+    
+    
+    # ------------------------------------------------------------------ secciones
+    
+    def _tabla(registros: list[dict], columnas: dict, clave: str, dinamica: bool = False, **cfg) -> list[dict]:
+        df = pd.DataFrame(registros, columns=list(columnas)) if registros else pd.DataFrame(columns=list(columnas))
+        ed = st.data_editor(df, column_config=columnas, hide_index=True, use_container_width=True,
+                            num_rows="dynamic" if dinamica else "fixed", key=clave, **cfg)
+        out = []
+        for r in ed.to_dict("records"):
+            out.append({k: (None if (isinstance(v, float) and pd.isna(v)) or v is pd.NaT else v) for k, v in r.items()})
+        return out
+    
+    
+    def _portada(ent):
+        st.caption("Registro de revisiones de la portada. Se propone la primera revisión del informe anterior con la fecha "
+                   "de cierre de la semana.")
+        cols = {"rev": st.column_config.TextColumn("Rev"), "fecha": st.column_config.DateColumn("Fecha", format="DD-MM-YYYY"),
+                "aprobo": st.column_config.TextColumn("Aprobó"), "reviso": st.column_config.TextColumn("Revisó"),
+                "preparo": st.column_config.TextColumn("Preparó"), "emitido": st.column_config.TextColumn("Emitido para", width="large")}
+        filas = _tabla(ent.revisiones, cols, "sem_rev", dinamica=True)
+        ent.revisiones = [r for r in filas if any(v not in (None, "") for v in r.values())]
+    
+    
+    def _resumen(pl, ent):
+        st.markdown("**1.1 Resumen de avances** — se calcula solo desde la hoja 7 (itemizado EC-002), con el avance de las "
+                    "planillas cargadas en la pestaña «7. Itemizado». La hoja POM 5 no se toca.")
+        st.markdown("**1.2 Datos financieros**")
+        c1, c2 = st.columns(2)
+        with c1:
+            for ref, et in pl.etiquetas_fin.items():
+                ent.financieros[ref] = st.number_input(et, value=float(ent.financieros.get(ref) or 0), step=1.0, format="%.0f",
+                                                       key=f"fin_{ref}")
+        with c2:
+            st.caption("Estados de pago facturados")
+            cols = {"nombre": st.column_config.TextColumn("EDP", disabled=True),
+                    "monto": st.column_config.NumberColumn("Monto parcial ($)", format="%.0f")}
+            filas = _tabla([{"nombre": e["nombre"], "monto": e["monto"]} for e in ent.edp], cols, "sem_edp")
+            for e, f in zip(ent.edp, filas):
+                e["monto"] = f["monto"]
+    
+        st.markdown("**1.3 Actividades críticas planificadas**")
+        cols = {"texto": st.column_config.TextColumn("Actividad", width="large"),
+                "obs": st.column_config.TextColumn("Observación", width="large")}
+        filas = _tabla([{"texto": x["texto"], "obs": x["obs"]} for x in ent.criticas], cols, "sem_cri")
+        for x, f in zip(ent.criticas, filas):
+            x.update(f)
+        st.markdown("**Consideraciones y alertas**")
+        cols = {"tema": st.column_config.TextColumn("Tema", width="medium"),
+                "detalle": st.column_config.TextColumn("Detalle", width="large")}
+        filas = _tabla([{"tema": x["tema"], "detalle": x["detalle"]} for x in ent.alertas], cols, "sem_ale")
+        for x, f in zip(ent.alertas, filas):
+            x.update(f)
+    
+        st.markdown("**1.4 Hitos contractuales** — la fecha real se completa sola cuando el hito está terminado en el "
+                    "último programa P6 cargado.")
+        cols = {"id": st.column_config.TextColumn("ID", disabled=True), "nombre": st.column_config.TextColumn("Hito", disabled=True),
+                "tipo": st.column_config.TextColumn("Tipo", disabled=True),
+                "programada": st.column_config.DateColumn("Programa", format="DD-MM-YYYY", disabled=True),
+                "real": st.column_config.DateColumn("Real", format="DD-MM-YYYY"),
+                "comentario": st.column_config.TextColumn("Comentario", width="large")}
+        filas = _tabla([{k: h.get(k) for k in cols} for h in ent.hitos], cols, "sem_hit")
+        for h, f in zip(ent.hitos, filas):
+            h["real"] = f["real"].date() if hasattr(f["real"], "date") and not isinstance(f["real"], dt.date) else f["real"]
+            h["comentario"] = f["comentario"]
+        st.caption("1.5 Resumen de dotación: se toma de la hoja 4.0 Dotación.")
+    
+    
+    def _seguridad(pl, ent):
+        hh = ent.hh_mod + ent.hh_moi
+        c1, c2, c3 = st.columns(3)
+        c1.metric("HH de la semana (MOD + MOI)", c.num(hh))
+        c2.metric("HH acumuladas anterior", c.num(pl.seg_hh_acum))
+        c3.metric("HH acumuladas nuevas", c.num(pl.seg_hh_acum + hh))
+        st.caption("Las HH se toman de la BD Personal del informe diario (11 HH por persona y día). Se corrigen en la "
+                   "pestaña 5. Curva dotación.")
+        st.markdown("**Accidentes del período** (el acumulado anterior es el acumulado del informe pasado)")
+        cols = st.columns(3)
+        for col, et in zip(cols, ("N° De Accidentes STP", "N° De Accidentes CTP", "Días Perdidos")):
+            prev = (pl.seg_valores.get(et) or (0, 0))[1] or 0
+            ent.seguridad[et] = col.number_input(f"{et} (acum. anterior {c.num(prev)})", min_value=0.0,
+                                                 value=float(ent.seguridad.get(et) or 0), step=1.0, key=f"seg_{et}")
+    
+    
+    def _curva(pl, fin):
+        if not pl.curva_actual:
+            st.warning("No se encontró la fila de la semana en la hoja 3. Curva de Avance.")
+            return
+        st.markdown(f"La fila de la semana al **{c.fecha(pl.curva_fechas.get(pl.curva_actual))}** queda con sus valores y "
+                    f"la fila al **{c.fecha(fin)}** toma las fórmulas del itemizado EC-002 (HH ganadas, gastadas y % real).")
+        st.caption("El avance de la semana sale de las planillas cargadas en la pestaña «7. Itemizado». Los ítems sin "
+                   "planilla quedan sin avance en la semana.")
+    
+    
+    def _dotacion(pl, ent):
+        st.caption("Promedio de la semana por cargo (BD Personal del informe diario): contratado = personas registradas, "
+                   "en faena = día T (indirectos también TT/TC acreditados) o noche TN, descanso = el resto.")
+        filas = [{"cargo": k, "tipo": d["tipo"], "contratado": d["contratado"], "faena": d["faena"], "descanso": d["descanso"],
+                  "previo": (pl.dot_previo.get(SM.norm(k)) or (None,))[0],
+                  "nuevo": SM.norm(k) not in pl.dot_directos and SM.norm(k) not in pl.dot_indirectos}
+                 for k, d in sorted(ent.dotacion.items(), key=lambda kv: (kv[1]["tipo"], kv[0]))]
+        cols = {"cargo": st.column_config.TextColumn("Cargo", width="large"),
+                "tipo": st.column_config.SelectboxColumn("Tipo", options=["Directo", "Indirecto"]),
+                "contratado": st.column_config.NumberColumn("Contratado", format="%.1f"),
+                "faena": st.column_config.NumberColumn("En faena", format="%.1f"),
+                "descanso": st.column_config.NumberColumn("En descanso", format="%.1f", disabled=True),
+                "previo": st.column_config.NumberColumn("Contratado sem. anterior", format="%.1f", disabled=True),
+                "nuevo": st.column_config.CheckboxColumn("Cargo nuevo", disabled=True)}
+        out = _tabla(filas, cols, "sem_dot", dinamica=True)
+        nueva = {}
+        for r in out:
+            if not r.get("cargo"):
+                continue
+            ctr, fae = float(r.get("contratado") or 0), float(r.get("faena") or 0)
+            nueva[r["cargo"]] = {"tipo": r.get("tipo") or "Directo", "contratado": ctr, "faena": fae, "descanso": round(ctr - fae, 1)}
+        ent.dotacion = nueva
+        tot = pd.DataFrame(nueva.values())
+        if not tot.empty:
+            g = tot.groupby("tipo")[["contratado", "faena", "descanso"]].sum().round(1)
+            st.dataframe(g, use_container_width=True)
+        nuevos = [k for k in nueva if SM.norm(k) not in pl.dot_directos and SM.norm(k) not in pl.dot_indirectos]
+        if nuevos:
+            st.info(f"{len(nuevos)} cargo(s) nuevo(s) se agregan a la hoja 4.0: " + ", ".join(nuevos))
+    
+    
+    def _curva_dotacion(pl, ent):
+        st.caption("HH reales de la semana (11 HH por persona y día, mismo criterio de las secciones 2.0 y 3.0 del informe "
+                   "diario). Puedes corregirlas.")
+        c1, c2 = st.columns(2)
+        ent.hh_mod = c1.number_input("HH MOD de la semana", min_value=0.0, value=float(ent.hh_mod), step=11.0, key="sem_hhmod")
+        c1.caption(f"Semana anterior: {c.num(pl.hh_semana_previa.get('MOD'))} HH · acumulado nuevo "
+                   f"{c.num(pl.mod_acum + ent.hh_mod)} HH")
+        ent.hh_moi = c2.number_input("HH MOI de la semana", min_value=0.0, value=float(ent.hh_moi), step=11.0, key="sem_hhmoi")
+        c2.caption(f"Semana anterior: {c.num(pl.hh_semana_previa.get('MOI'))} HH · acumulado nuevo "
+                   f"{c.num(pl.moi_acum + ent.hh_moi)} HH")
+        c1.metric("Dotación MOD promedio", c.num(ent.hh_mod / 77, 1))
+        c2.metric("Dotación MOI promedio", c.num(ent.hh_moi / 77, 1))
+    
+    
+    def _itemizado(pl, ent, clave):
+        if not pl.itm_hoja:
+            st.warning("El informe base no tiene la hoja «7.Avance EC-002 Itemizado».")
+            return
+        st.markdown("Sube las **planillas de avance** de la semana (piping, civil, mecánica-estructuras, eléctrica). Del "
+                    "itemizado EC-002 de cada una se "
+                    "toma la **cantidad acumulada WEEKLY** de cada ítem y pasa a la columna *Avance acumulado* del itemizado "
+                    "EC-002. El acumulado del informe anterior pasa a *Avance anterior*. Los ítems que no vienen en ninguna "
+                    "planilla quedan sin avance en la semana. La hoja POM 5 no se toca.")
+        archivos = st.file_uploader("Planillas de avance (.xlsx)", type=["xlsx", "xlsm"], accept_multiple_files=True,
+                                    key=f"up_plan_{clave}")
+        k_pl = f"planillas_{clave}"
+        cargas = db.cargas_cubicacion(c.contrato_id())
+        if not cargas.empty:
+            fechas = sorted(cargas["fecha"].unique(), reverse=True)
+            a, b = st.columns([2, 1])
+            f_cub = a.selectbox("…o usar las planillas guardadas en **Cubicación por disciplina** (semana al)", fechas,
+                                format_func=c.fecha, key=f"sel_cub_{clave}")
+            if b.button("Usar planillas guardadas", key="btn_plan_cub"):
+                leidas = {}
+                for r in cargas[cargas["fecha"] == f_cub].sort_values("id").itertuples():
+                    d = db.carga_cubicacion(int(r.id))
+                    try:
+                        leidas[r.archivo] = SM.desde_cubicacion(CUB.PlanillaCub.de_dict(d))
+                    except Exception as e:
+                        st.error(f"{r.archivo}: {e}")
+                st.session_state[k_pl] = leidas
+        if archivos and st.button(f"Leer {len(archivos)} planilla(s)", type="primary", key="btn_plan"):
+            leidas, errores = {}, []
+            for a in archivos:
+                try:
+                    leidas[a.name] = _planilla(a.getvalue(), a.name)
+                except Exception as e:
+                    errores.append(f"{a.name}: {e}")
+            for e in errores:
+                st.error(e)
+            st.session_state[k_pl] = leidas
+        leidas = st.session_state.get(k_pl) or {}
+        if not leidas:
+            ent.avance_items, ent.fuentes_avance = {}, []
+            st.info("Sin planillas cargadas: el itemizado pasa a la semana nueva sin avance (período 0).")
+            return
+    
+        avance, fuente, filas, fuera = {}, {}, [], []
+        for nombre, p in leidas.items():
+            for item, d in p["items"].items():
+                if item not in pl.itm_filas:
+                    fuera.append(item)
+                    continue
+                avance[item] = avance.get(item, 0.0) + d["cant"]
+                fuente[item] = nombre
+        for item, cant in sorted(avance.items()):
+            info = pl.itm_info.get(item, {})
+            ant = info.get("cant") or 0.0
+            rend = info.get("rend") or 0.0
+            filas.append({"item": item, "descripcion": info.get("descripcion", ""), "unidad": info.get("unidad", ""),
+                          "anterior": round(ant, 3), "acumulado": round(cant, 3), "periodo": round(cant - ant, 3),
+                          "hh": round((cant - ant) * rend, 1), "pom": round(info.get("pom") or 0, 3),
+                          "planilla": fuente[item]})
+        df = pd.DataFrame(filas)
+        cols = {"item": st.column_config.TextColumn("Ítem", disabled=True),
+                "descripcion": st.column_config.TextColumn("Descripción", disabled=True, width="large"),
+                "unidad": st.column_config.TextColumn("Un.", disabled=True, width="small"),
+                "anterior": st.column_config.NumberColumn("Acumulado informe anterior", format="%.2f", disabled=True),
+                "acumulado": st.column_config.NumberColumn("Acumulado nuevo", format="%.2f"),
+                "periodo": st.column_config.NumberColumn("Período", format="%.2f", disabled=True),
+                "hh": st.column_config.NumberColumn("HH ganadas período", format="%.0f", disabled=True),
+                "pom": st.column_config.NumberColumn("Cantidad POM 5", format="%.2f", disabled=True),
+                "planilla": st.column_config.TextColumn("Planilla", disabled=True)}
+        ed = st.data_editor(df, column_config=cols, hide_index=True, use_container_width=True, key=f"ed_itm_{clave}")
+        ent.avance_items = {r["item"]: float(r["acumulado"] or 0) for r in ed.to_dict("records")}
+        ent.fuentes_avance = list(leidas)
+        per = df["periodo"].sum() if not df.empty else 0
+        k = st.columns(4)
+        k[0].metric("Ítems con avance", len(df))
+        k[1].metric("Ítems que avanzan esta semana", int((df["periodo"] > 0.0001).sum()) if not df.empty else 0)
+        k[2].metric("HH ganadas en la semana", c.num(df["hh"].sum() if not df.empty else 0))
+        k[3].metric("Ítems con retroceso", int((df["periodo"] < -0.0001).sum()) if not df.empty else 0,
+                    help="Acumulado nuevo menor que el del informe anterior: revisa la planilla.")
+        if per < 0 or (not df.empty and (df["periodo"] < -0.0001).any()):
+            st.warning("Hay ítems con acumulado menor al del informe anterior (período negativo). Revisa si la planilla "
+                       "corresponde a esta semana.")
+        for nombre, p in leidas.items():
+            dif = [it for it, d in p["items"].items() if it in pl.itm_info
+                   and abs(d["anterior"] - (pl.itm_info[it].get("cant") or 0)) > 0.05]
+            if dif:
+                st.caption(f"ℹ️ {nombre}: en {len(dif)} ítem(s) el «avance anterior» de la planilla no coincide con el acumulado "
+                           f"del informe anterior (p. ej. {', '.join(dif[:4])}).")
+        if fuera:
+            st.caption(f"⚠️ {len(fuera)} ítem(s) de las planillas no existen en el itemizado del informe y se omiten: "
+                       + ", ".join(sorted(set(fuera))[:8]))
+    
+    
+    @st.cache_data(show_spinner="Leyendo planilla de avance…", max_entries=6)
+    def _planilla(datos: bytes, nombre: str):
+        return SM.leer_planilla_avance(datos, nombre)
+    
+    
+    def _generar(base, pl, ent, sem, cid):
+        st.markdown("**Revisión**")
+        fila = lambda ok, t, d: st.markdown(f"{'✅' if ok else '⚠️'} **{t}** — {d}")
+        fila(True, "Portada", f"{len(ent.revisiones)} revisión(es)")
+        fila(True, "1. Resumen", f"{len(ent.criticas)} actividades críticas · {len(ent.alertas)} alertas · "
+                                 f"{sum(1 for h in ent.hitos if h.get('real'))} de {len(ent.hitos)} hitos con fecha real")
+        fila(pl.seg_ultima > 0, "2. Seguridad", f"{c.num(ent.hh_mod + ent.hh_moi)} HH en la semana")
+        fila(pl.curva_actual > 0, "3. Curva de avance", "rueda a la semana nueva (itemizado sin cambios)")
+        fila(bool(ent.dotacion), "4.0 Dotación", f"{len(ent.dotacion)} cargos")
+        fila(ent.hh_mod > 0 and ent.hh_moi > 0, "5. Curva dotación", f"MOD {c.num(ent.hh_mod)} HH · MOI {c.num(ent.hh_moi)} HH")
+        fila(bool(ent.avance_items), "7. Itemizado", (f"{len(ent.avance_items)} ítems desde " + ", ".join(ent.fuentes_avance))
+             if ent.avance_items else "sin planillas de avance: la semana queda sin avance")
+        if sem.dias_sin_datos:
+            fila(False, "Datos diarios", "faltan días en la BD Personal: " + ", ".join(c.fecha(d) for d in sem.dias_sin_datos))
+        st.caption("Equipos, dashboards T&M, programa, 6 Weeks, fotos, NDC y RFI quedan como en el informe anterior. "
+                   "Las HH gastadas por ítem del itemizado no se cambian.")
+    
+        if st.button(f"Generar informe semanal N° {ent.numero}", type="primary", key="btn_gen_sem"):
+            try:
+                with st.spinner("Generando…"):
+                    datos, avisos = SM.generar(pl, ent)
+            except Exception as e:
+                st.error(f"No se pudo generar: {e}")
+                return
+            nombre = f"{ent.numero}. Informe Semanal {ent.inicio + dt.timedelta(days=6):%d-%m-%Y}_ Rev.A.xlsx"
+            st.session_state["sem_generado"] = (nombre, datos, avisos)
+        if st.session_state.get("sem_generado"):
+            nombre, datos, avisos = st.session_state["sem_generado"]
+            for a in avisos:
+                st.warning(a)
+            st.success(f"Informe listo: {nombre}")
+            st.download_button("⬇️ Descargar Excel", datos, file_name=nombre, mime=MIME_XLSX, key="dl_sem")
+            if st.button("Usar como base para la próxima semana", key="btn_usar_sem"):
+                db.guardar_base_semanal(nombre, (ent.inicio + dt.timedelta(days=6)).isoformat(), ent.numero, datos,
+                                        c.nombre_usuario(), "generado", contrato_id=cid)
+                st.session_state.pop("sem_generado", None)
+                st.cache_resource.clear()
+                st.success("Listo: el informe generado es la nueva base.")
+                st.rerun()
+
+    return SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
+
+
+vsemanal = _modulo_vsemanal()
+
+# ======================================================================
 # MÓDULO: informe
 # ======================================================================
 def _modulo_informe():
@@ -8862,6 +13052,7 @@ def _modulo_informe():
     DV = desviaciones
     CAL = calendario
     c = comun
+    VS = vsemanal
     
     HOJA_PREFERIDA = "7.Avance EC-002 Itemizado"
     NADA = "(no aplica)"
@@ -8870,12 +13061,22 @@ def _modulo_informe():
     
     def vista():
         st.title("Informe semanal")
-        t_hist, t_carga = st.tabs(["Historial y comparación", "Cargar informe"])
+        st.caption("**Crear informe**: arma el informe de la semana nueva sobre el último emitido · "
+                   "**Avance y comparación**: curva de avance y diferencias entre dos semanas · "
+                   "**Registrar en el historial**: guarda el itemizado de un informe para compararlo · "
+                   "**Informes guardados**: lista y eliminación.")
+        t_crear, t_hist, t_carga, t_lista = st.tabs(["📝 Crear informe", "📈 Avance y comparación",
+                                                     "📥 Registrar en el historial", "🗂️ Informes guardados"])
+        with t_crear:
+            if c.exigir("cargar"):
+                VS.crear()
         with t_carga:
             if c.exigir("cargar"):
                 _cargar()
         with t_hist:
             _historial()
+        with t_lista:
+            _guardados()
     
     
     @st.cache_data(show_spinner="Leyendo hoja…", max_entries=6)
@@ -8917,26 +13118,36 @@ def _modulo_informe():
         return None
     
     
+    def _paso(n: int, titulo: str, detalle: str = ""):
+        st.markdown(f"#### {n}. {titulo}")
+        if detalle:
+            st.caption(detalle)
+    
+    
     def _cargar():
+        st.markdown("Guarda el avance por ítem (hoja de itemizado) de un informe semanal ya emitido. Con dos o más informes "
+                    "guardados se arma la curva de avance y la comparación entre semanas.")
+        _paso(1, "Sube el Excel del informe", f"La app busca sola la hoja **{HOJA_PREFERIDA}** (o la de itemizado más "
+              "parecida), la fila de encabezado y las columnas. Solo cambia algo si la sugerencia no calza.")
         archivo = st.file_uploader("Excel del informe semanal", type=["xlsx", "xlsm", "xls"], key="up_inf")
         if archivo is None:
-            st.caption(f"Se busca automáticamente la hoja **{HOJA_PREFERIDA}** (o la hoja de itemizado más parecida).")
             return
         datos = archivo.getvalue()
         hojas = _hojas(datos)
         sugerida = _hoja_sugerida(hojas)
-        hoja = st.selectbox("Hoja", hojas, index=hojas.index(sugerida), key="inf_hoja")
-        _, fila_auto, _, _ = _leer(datos, hoja, None)
-        fila = st.number_input("Fila del encabezado (1 = primera fila del Excel)", 1, 200, fila_auto + 1, key=f"inf_fila_{hoja}",
-                               help="Si el encabezado ocupa varias filas, indica la fila principal; las combinadas se leen solas.") - 1
+    
+        _paso(2, "Revisa lo que se detectó")
+        with st.expander("Hoja y fila de encabezado", expanded=False):
+            hoja = st.selectbox("Hoja", hojas, index=hojas.index(sugerida), key="inf_hoja")
+            _, fila_auto, _, _ = _leer(datos, hoja, None)
+            fila = st.number_input("Fila del encabezado (1 = primera fila del Excel)", 1, 200, fila_auto + 1,
+                                   key=f"inf_fila_{hoja}",
+                                   help="Si el encabezado ocupa varias filas, indica la fila principal; las combinadas se leen solas.") - 1
         df, _, col_excel, filas_enc = _leer(datos, hoja, fila)
         if df.empty:
-            st.warning("La hoja no tiene datos bajo esa fila de encabezado.")
+            st.warning("La hoja no tiene datos bajo esa fila de encabezado. Ábrela en «Hoja y fila de encabezado» y corrígela.")
             return
-        if filas_enc and filas_enc[0] != filas_enc[1]:
-            st.caption(f"Encabezado leído en las filas {filas_enc[0]} a {filas_enc[1]} (celdas combinadas).")
-        with st.expander("Vista previa de la hoja", expanded=False):
-            st.dataframe(df.head(30), use_container_width=True)
+        enc = f"filas {filas_enc[0]} a {filas_enc[1]}" if filas_enc and filas_enc[0] != filas_enc[1] else f"fila {fila + 1}"
     
         cols = df.columns.tolist()
     
@@ -8946,8 +13157,10 @@ def _modulo_informe():
             v = col.selectbox(etiqueta, ops, index=ops.index(sug) if sug in ops else 0, key=key or f"inf_{clave}_{hoja}")
             return None if v == NADA else v
     
-        st.markdown("**Mapeo de columnas** (revisa las sugerencias)")
-        a, b = st.columns(2)
+        exp_cols = st.expander("Columnas que se usan", expanded=False)
+        with exp_cols:
+            st.dataframe(df.head(15), use_container_width=True, height=220)
+        a, b = exp_cols.columns(2)
         col_item = elegir(a, "Ítem / código", "item", False)
         col_desc = elegir(b, "Descripción (opcional, se agrega al ítem)", "descripcion", True)
         col_atc = elegir(a, "At Completion / presupuesto vigente (HH)", "at_completion", False)
@@ -8956,11 +13169,13 @@ def _modulo_informe():
         modo = b.selectbox("¿Cómo viene el avance?", modos, format_func=MODOS.get, key=f"inf_modo_{hoja}")
         col_medida = elegir(a, f"Columna de {MODOS[modo]}", modo, False, key=f"inf_med_{modo}_{hoja}")
         col_gas = elegir(b, "HH gastadas acumuladas (opcional, para el PF)", "gastadas", True)
-        a, b = st.columns(2)
+        a, b = exp_cols.columns(2)
         excluir = a.checkbox("Excluir filas de total", value=True, key="inf_excl_tot")
         excluir_sub = b.checkbox("Excluir subtotales (fórmulas SUM o filas que suman otras)", value=True,
                                  key="inf_excl_sub",
                                  help="Evita contar dos veces las horas cuando la planilla tiene varios niveles de agrupación.")
+        st.caption(f"Hoja **{hoja}** · encabezado en {enc} · ítem: **{col_item}** · At Completion: **{col_atc}** · "
+                   f"avance: **{col_medida}** ({MODOS[modo]})" + (f" · HH gastadas: **{col_gas}**" if col_gas else ""))
     
         usadas = tuple(col_excel.get(x) for x in (col_atc, col_medida, col_gas) if x and col_excel.get(x))
         filas_suma = _filas_suma(datos, hoja, usadas) if excluir_sub else None
@@ -8981,13 +13196,13 @@ def _modulo_informe():
             st.warning("No quedaron ítems con valores numéricos. Revisa el mapeo de columnas.")
             return
     
-        st.markdown("**Revisa qué filas se suman** (desmarca o marca *Incluir* si hace falta)")
+        exp_filas = st.expander("Filas que se suman (marca o desmarca «Incluir»)", expanded=False)
         clave_editor = f"inf_ed_{archivo.name}_{hoja}_{fila}_{col_item}_{col_atc}_{modo}_{col_medida}_{excluir}_{excluir_sub}"
         columnas_tabla = ["incluir", "fila_origen", "item", "at_completion", "actual", "remaining", "avance_pct"]
         if col_gas:
             columnas_tabla.append("hh_gastadas")
         columnas_tabla.append("motivo")
-        editado = st.data_editor(
+        editado = exp_filas.data_editor(
             items[columnas_tabla],
             hide_index=True, use_container_width=True, height=360, key=clave_editor,
             disabled=[x for x in columnas_tabla if x != "incluir"],
@@ -9003,6 +13218,7 @@ def _modulo_informe():
         finales = items[items["incluir"]]
     
         pf = analisis.productividad(finales)
+        _paso(3, "Confirma los totales", "Compáralos con los totales de tu Excel antes de guardar.")
         k = st.columns(5 if pf is not None else 4)
         k[0].metric("Ítems incluidos", f"{len(finales)} de {len(items)}")
         k[1].metric("At Completion", f"{c.num(finales['at_completion'].sum())} HH")
@@ -9027,7 +13243,7 @@ def _modulo_informe():
                            "Revisa las filas marcadas en la tabla o la columna elegida como At Completion.")
     
         resumen = _resumen_semanal(archivo.getvalue())
-        st.markdown("**Registrar**")
+        _paso(4, "Guarda el informe en el historial")
         a, b, d = st.columns([2, 1, 2])
         fecha_corte = b.date_input("Fecha de corte", (resumen or {}).get("hasta") or _fecha_desde_nombre(archivo.name) or dt.date.today(),
                                    format="DD-MM-YYYY", key="inf_fecha")
@@ -9055,9 +13271,9 @@ def _modulo_informe():
             if not previos.empty:
                 p_ = previos.iloc[-1]
                 previo = (pd.Timestamp(p_["fecha_corte"]).date(), p_["hh_gastadas"], p_["at_completion"] - p_["remaining"])
-            st.divider()
-            cruce_desviaciones(fecha_corte, float(finales["hh_gastadas"].sum() if "hh_gastadas" in finales else 0),
-                               float(finales["actual"].sum()), previo, "carga", resumen)
+            with st.expander("📉 Opcional: impacto de las desviaciones de recursos en el PF de este informe", expanded=False):
+                cruce_desviaciones(fecha_corte, float(finales["hh_gastadas"].sum() if "hh_gastadas" in finales else 0),
+                                   float(finales["actual"].sum()), previo, "carga", resumen)
     
     
     def _informes():
@@ -9077,7 +13293,7 @@ def _modulo_informe():
     def _historial():
         inf = _informes()
         if inf.empty:
-            st.info("Aún no hay informes guardados. Usa la pestaña **Cargar informe**.")
+            st.info("Aún no hay informes en el historial. Guárdalos en la pestaña **📥 Registrar en el historial**.")
             return
         inf = inf.copy()
         inf["avance_pct"] = [analisis.pct(t - r, t) for t, r in zip(inf["at_completion"], inf["remaining"])]
@@ -9088,6 +13304,22 @@ def _modulo_informe():
             filtro = st.selectbox("Proyecto", proyectos, key="hist_proy")
             inf = inf[inf["proyecto"].fillna("Sin asociar") == filtro]
     
+        # --- Situación al último informe
+        ult = inf.sort_values("fecha_corte").iloc[-1]
+        ant = inf.sort_values("fecha_corte").iloc[-2] if len(inf) > 1 else None
+        st.subheader(f"Situación al {c.fecha(ult['fecha_corte'])}")
+        st.caption(f"Último informe del historial: {ult['nombre']}")
+        gan_u = ult["at_completion"] - ult["remaining"]
+        k = st.columns(4)
+        k[0].metric("Avance acumulado", c.porc(ult["avance_pct"]),
+                    delta=None if ant is None else f"{c.num(ult['avance_pct'] - ant['avance_pct'], 2)} pp en la semana")
+        k[1].metric("HH ganadas acumuladas", c.num(gan_u),
+                    delta=None if ant is None else f"{c.num(gan_u - (ant['at_completion'] - ant['remaining']))} HH en la semana")
+        k[2].metric("At Completion", f"{c.num(ult['at_completion'])} HH")
+        pf_u = ult["hh_gastadas"] / gan_u if pd.notna(ult.get("hh_gastadas")) and gan_u > 0 else None
+        k[3].metric("PF acumulado", c.num(pf_u, 2) if pf_u is not None else "–",
+                    help="HH gastadas / HH ganadas. Sobre 1: se gastan más horas de las que se ganan.")
+    
         st.subheader("Curva de avance")
         ev = inf.assign(Fecha=pd.to_datetime(inf["fecha_corte"]))
         fig = px.line(ev, x="Fecha", y="avance_pct", markers=True, text=[c.porc(v, 1) for v in ev["avance_pct"]],
@@ -9096,12 +13328,13 @@ def _modulo_informe():
         fig.update_yaxes(range=[0, 105])
         st.plotly_chart(c.layout_grafico(fig, 320), use_container_width=True, key="inf_curva_avance")
     
-        st.subheader("Comparar dos informes")
+        st.subheader("Comparar dos semanas")
+        st.caption("Por defecto se comparan los dos últimos informes. Cambia cualquiera de los dos para ver otro período.")
         ids = inf["id"].tolist()
         etiquetas = dict(zip(inf["id"], inf["etiqueta"]))
         a, b = st.columns(2)
-        id_a = a.selectbox("Informe base", ids, index=max(0, len(ids) - 2), format_func=etiquetas.get, key="cmp_a")
-        id_b = b.selectbox("Informe a comparar", ids, index=len(ids) - 1, format_func=etiquetas.get, key="cmp_b")
+        id_a = a.selectbox("Desde (informe anterior)", ids, index=max(0, len(ids) - 2), format_func=etiquetas.get, key="cmp_a")
+        id_b = b.selectbox("Hasta (informe más reciente)", ids, index=len(ids) - 1, format_func=etiquetas.get, key="cmp_b")
         items = _items(tuple(sorted({int(id_a), int(id_b)})))
         ia = items[items["informe_id"] == id_a].groupby("item", sort=False)[["at_completion", "remaining"]].sum()
         ib = items[items["informe_id"] == id_b].groupby("item", sort=False)[["at_completion", "remaining"]].sum()
@@ -9119,8 +13352,8 @@ def _modulo_informe():
     
         pf_a, pf_b = pf_de(tot_a), pf_de(tot_b)
         k = st.columns(4 if pf_b is not None else 3)
-        k[0].metric("Avance base", c.porc(tot_a["avance_pct"]))
-        k[1].metric("Avance comparado", c.porc(tot_b["avance_pct"]),
+        k[0].metric("Avance «desde»", c.porc(tot_a["avance_pct"]))
+        k[1].metric("Avance «hasta»", c.porc(tot_b["avance_pct"]),
                     delta=f"{c.num(tot_b['avance_pct'] - tot_a['avance_pct'], 2)} pp")
         k[2].metric("HH ganadas en el período", c.num(comp["hh_ganadas"].sum()))
         if pf_b is not None:
@@ -9132,25 +13365,9 @@ def _modulo_informe():
         if pf_b is not None or resumen_b:
             fa, fb = pd.Timestamp(tot_a["fecha_corte"]).date(), pd.Timestamp(tot_b["fecha_corte"]).date()
             previo = (fa, tot_a["hh_gastadas"], tot_a["at_completion"] - tot_a["remaining"]) if fa < fb and pf_a is not None else None
-            with st.expander("📉 Impacto de las desviaciones de recursos en el PF y recuento de la semana", expanded=True):
+            with st.expander("📉 Impacto de las desviaciones de recursos en el PF y recuento de la semana", expanded=False):
                 cruce_desviaciones(fb, float(tot_b["hh_gastadas"] or 0) if pd.notna(tot_b["hh_gastadas"]) else 0.0,
                                    float(tot_b["at_completion"] - tot_b["remaining"]), previo, "hist", resumen_b)
-    
-        st.dataframe(
-            comp[["item", "at_completion_b", "avance_a", "avance_b", "delta_pp", "hh_ganadas"]],
-            hide_index=True, use_container_width=True, height=min(600, 38 + 35 * len(comp)),
-            column_config={
-                "item": st.column_config.TextColumn("Ítem", width="large"),
-                "at_completion_b": st.column_config.NumberColumn("At Completion (HH)", format="%.0f"),
-                "avance_a": st.column_config.NumberColumn("% base", format="%.2f%%"),
-                "avance_b": st.column_config.ProgressColumn("% comparado", format="%.2f%%", min_value=0, max_value=100),
-                "delta_pp": st.column_config.NumberColumn("Δ pp", format="%+.2f"),
-                "hh_ganadas": st.column_config.NumberColumn("HH ganadas", format="%.0f"),
-            },
-        )
-        st.download_button("Descargar comparación (Excel)", analisis.a_excel({"Comparación": comp, "Informes": inf}),
-                           file_name="comparacion_informes.xlsx", key="dl_cmp",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     
         top = comp[comp["delta_pp"] != 0].nlargest(15, "hh_ganadas")
         if not top.empty:
@@ -9159,18 +13376,45 @@ def _modulo_informe():
                          color_discrete_sequence=[c.NARANJO], title="Ítems con más avance en el período")
             st.plotly_chart(c.layout_grafico(fig, max(300, 28 * len(top))), use_container_width=True, key="inf_top_items")
     
-        with st.expander("Informes guardados"):
-            st.dataframe(inf[["nombre", "fecha_corte", "proyecto", "items", "at_completion", "avance_pct", "archivo", "cargado_por"]],
-                         hide_index=True, use_container_width=True,
-                         column_config={"nombre": "Informe", "fecha_corte": "Fecha de corte", "proyecto": "Proyecto",
-                                        "items": "Ítems", "archivo": "Archivo", "cargado_por": "Cargado por",
-                                        **c.COLUMNAS_HORAS})
-            if c.usuario() and c.usuario()["rol"] in ("admin", "planificador"):
-                borrar = st.selectbox("Eliminar un informe", ids, format_func=etiquetas.get, key="inf_borrar")
-                if st.button("Eliminar informe seleccionado", key="btn_inf_borrar"):
-                    db.borrar_informe(int(borrar))
-                    c.limpiar_cache()
-                    st.rerun()
+        st.markdown("**Detalle por ítem**")
+        st.dataframe(
+            comp[["item", "at_completion_b", "avance_a", "avance_b", "delta_pp", "hh_ganadas"]],
+            hide_index=True, use_container_width=True, height=min(600, 38 + 35 * len(comp)),
+            column_config={
+                "item": st.column_config.TextColumn("Ítem", width="large"),
+                "at_completion_b": st.column_config.NumberColumn("At Completion (HH)", format="%.0f"),
+                "avance_a": st.column_config.NumberColumn("% desde", format="%.2f%%"),
+                "avance_b": st.column_config.ProgressColumn("% hasta", format="%.2f%%", min_value=0, max_value=100),
+                "delta_pp": st.column_config.NumberColumn("Δ pp", format="%+.2f"),
+                "hh_ganadas": st.column_config.NumberColumn("HH ganadas", format="%.0f"),
+            },
+        )
+        st.download_button("Descargar comparación (Excel)", analisis.a_excel({"Comparación": comp, "Informes": inf}),
+                           file_name="comparacion_informes.xlsx", key="dl_cmp",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    
+    
+    
+    def _guardados():
+        inf = _informes()
+        if inf.empty:
+            st.info("Aún no hay informes en el historial.")
+            return
+        inf = inf.copy()
+        inf["avance_pct"] = [analisis.pct(t - r, t) for t, r in zip(inf["at_completion"], inf["remaining"])]
+        ids = inf["id"].tolist()
+        etiquetas = {i: f"{n} ({c.fecha(f)})" for i, n, f in zip(inf["id"], inf["nombre"], inf["fecha_corte"])}
+        st.dataframe(inf[["nombre", "fecha_corte", "proyecto", "items", "at_completion", "avance_pct", "archivo", "cargado_por"]],
+                     hide_index=True, use_container_width=True,
+                     column_config={"nombre": "Informe", "fecha_corte": "Fecha de corte", "proyecto": "Proyecto",
+                                    "items": "Ítems", "archivo": "Archivo", "cargado_por": "Cargado por",
+                                    **c.COLUMNAS_HORAS})
+        if c.usuario() and c.usuario()["rol"] in ("admin", "planificador"):
+            borrar = st.selectbox("Eliminar un informe", ids, format_func=etiquetas.get, key="inf_borrar")
+            if st.button("Eliminar informe seleccionado", key="btn_inf_borrar"):
+                db.borrar_informe(int(borrar))
+                c.limpiar_cache()
+                st.rerun()
     
     
     # ------------------------------------------------------------------ cruce con el LOG de desviaciones
@@ -9629,6 +13873,127 @@ def _modulo_vdiario():
         return salida
     
     
+    # ------------------------------------------------------------------ borrador del informe (guardar y continuar)
+    
+    _NO_GUARDAR = ("_gen", "_pdf_btn", "_emitir", "_dl", "_dl_pdf", "_aj_btn", "_aj_rut", "_aj_est", "_xlsx", "_pdf")
+    
+    
+    def _a_json(v):
+        if v is None or isinstance(v, (str, bool)):
+            return v
+        if isinstance(v, (int, float)):
+            return None if isinstance(v, float) and pd.isna(v) else v
+        if hasattr(v, "item"):                                  # numpy
+            return _a_json(v.item())
+        if isinstance(v, (dt.date, dt.datetime, pd.Timestamp)):
+            return None if pd.isna(v) else v.isoformat()
+        if isinstance(v, dt.time):
+            return v.strftime("%H:%M")
+        return str(v)
+    
+    
+    def _clave_borrador(clave: str) -> str:
+        return "borrador_" + clave
+    
+    
+    def _restaurar_borrador(clave: str):
+        """Una vez por sesión: si hay un borrador guardado de este informe, vuelve a poner lo que se había avanzado."""
+        marca = f"{clave}__restaurado"
+        if st.session_state.get(marca):
+            return
+        st.session_state[marca] = True
+        b = db.config(c.contrato_id(), _clave_borrador(clave), None)
+        if not b:
+            return
+        for k, v in (b.get("widgets") or {}).items():
+            if k not in st.session_state:
+                st.session_state[k] = v
+        if b.get("ajustes") is not None:
+            st.session_state[f"{clave}_ajustes"] = dict(b["ajustes"])
+        st.session_state[f"{clave}__editores"] = b.get("editores") or {}
+        st.session_state[f"{clave}__texto"] = b.get("texto") or {}
+        st.session_state[f"{clave}__info"] = {"guardado": b.get("guardado"), "usuario": b.get("usuario"), "restaurado": True}
+    
+    
+    def _guardar_borrador(clave: str):
+        widgets = {}
+        for k, v in st.session_state.items():
+            k = str(k)
+            if not k.startswith(clave + "_") or "__" in k or "_ed_" in k or "_texto_" in k or k.endswith(_NO_GUARDAR):
+                continue
+            if isinstance(v, (str, int, float, bool)) and not (isinstance(v, float) and pd.isna(v)):
+                widgets[k] = v
+        editores = {k.split("__res__", 1)[1]: v for k, v in st.session_state.items()
+                    if str(k).startswith(f"{clave}__res__")}
+        ahora = dt.datetime.now().strftime("%d-%m-%Y %H:%M")
+        db.guardar_config(c.contrato_id(), _clave_borrador(clave), {
+            "widgets": widgets, "editores": editores, "ajustes": st.session_state.get(f"{clave}_ajustes") or {},
+            "texto": st.session_state.get(f"{clave}__texto_actual") or {}, "guardado": ahora, "usuario": c.nombre_usuario()})
+        st.session_state[f"{clave}__info"] = {"guardado": ahora, "usuario": c.nombre_usuario()}
+    
+    
+    def _borrar_borrador(clave: str):
+        db.guardar_config(c.contrato_id(), _clave_borrador(clave), None)
+        for k in [k for k in st.session_state if str(k).startswith(clave)]:
+            del st.session_state[k]
+    
+    
+    def _aplicar_borrador(df: pd.DataFrame, guardado: list[dict], id_col: str | None) -> pd.DataFrame:
+        df = df.reset_index(drop=True).copy()
+        if id_col and id_col in df.columns and guardado and all(id_col in r for r in guardado):
+            usados = set()
+            for r in guardado:
+                filas = [i for i in df.index[df[id_col].astype(str) == str(r[id_col])] if i not in usados]
+                if not filas:
+                    continue
+                i = filas[0]
+                usados.add(i)
+                for col, v in r.items():
+                    if col in df.columns and col != id_col:
+                        try:
+                            df.at[i, col] = v
+                        except (ValueError, TypeError):
+                            df[col] = df[col].astype(object)
+                            df.at[i, col] = v
+            return df
+        nuevo = pd.DataFrame([{col: r.get(col) for col in df.columns} for r in guardado], columns=df.columns)
+        for col in df.columns:
+            if pd.api.types.is_bool_dtype(df[col]):
+                nuevo[col] = nuevo[col].fillna(False).astype(bool)
+            elif pd.api.types.is_numeric_dtype(df[col]):
+                nuevo[col] = pd.to_numeric(nuevo[col], errors="coerce")
+        return nuevo
+    
+    
+    def _editor(clave: str, nombre: str, df: pd.DataFrame, id_col: str | None = None, **kw) -> pd.DataFrame:
+        """st.data_editor que retoma lo guardado en el borrador y deja su resultado listo para guardar."""
+        guardado = (st.session_state.get(f"{clave}__editores") or {}).get(nombre)
+        if guardado is not None:
+            df = _aplicar_borrador(df, guardado, id_col)
+        ed = st.data_editor(df, key=f"{clave}_ed_{nombre}", **kw)
+        st.session_state[f"{clave}__res__{nombre}"] = [{k: _a_json(v) for k, v in r.items()} for r in ed.to_dict("records")]
+        return ed
+    
+    
+    def _barra_borrador(clave: str):
+        info = st.session_state.get(f"{clave}__info")
+        a, b, d = st.columns([1.2, 1.2, 3])
+        if a.button("💾 Guardar avance", key=f"{clave}__btn_guardar", type="primary",
+                    help="Guarda lo que llevas del informe. Si se recarga la página o se cierra la app, continúas desde aquí."):
+            _guardar_borrador(clave)
+            st.toast("Avance guardado")
+            info = st.session_state.get(f"{clave}__info")
+        if info and b.button("Descartar borrador", key=f"{clave}__btn_descartar",
+                             help="Borra lo guardado y vuelve a partir desde los reportes."):
+            _borrar_borrador(clave)
+            st.rerun()
+        if info:
+            txt = f"Último guardado: {info['guardado']} por {info['usuario']}"
+            d.caption(("♻️ Se retomó el avance guardado. " if info.get("restaurado") else "💾 ") + txt)
+        else:
+            d.caption("Aún no has guardado este informe. Usa «Guardar avance» para no perder lo que llevas si se recarga la página.")
+    
+    
     def vista():
         st.title("Informe diario")
         if not c.exigir("cargar"):
@@ -9730,6 +14095,30 @@ def _modulo_vdiario():
                 st.error(e)
             if not errores:
                 st.rerun()
+        with st.expander("📦 PM de materiales (PDF) → 8.0 Materiales y consumibles", expanded=False):
+            st.caption("Sube todos los PM del día de una vez. Cada material de cada PDF pasa a la sección 8.0 del informe "
+                       "(descripción, unidad, cantidad, Activity ID / trabajo, solicitante y N° de PM). Si son más filas de "
+                       "las que trae la planilla, la sección se amplía.")
+            pms = st.file_uploader("PM de materiales (.pdf)", type=["pdf"], accept_multiple_files=True, key=f"up_pm_{fecha}")
+            if pms and st.button(f"Agregar {len(pms)} PM", type="primary", key="btn_pm"):
+                errores, resumen = [], []
+                for a in pms:
+                    try:
+                        r = D.leer_pm_materiales(a.getvalue(), a.name)
+                        if r.fecha and r.fecha != fecha:
+                            resumen.append(f"⚠️ **{a.name}** tiene fecha {c.fecha(r.fecha)}; se agrega igual al {c.fecha(fecha)}.")
+                        db.guardar_reporte_diario(fecha.isoformat(), r.archivo, r.a_dict(), c.nombre_usuario(),
+                                                  contrato_id=c.contrato_id())
+                        resumen.append(f"**{a.name}**: {len(r.materiales)} material(es)"
+                                       + (f" · solicitado por {r.supervisor}" if r.supervisor else ""))
+                    except Exception as e:
+                        errores.append(f"{a.name}: {e}")
+                st.session_state[f"rep_resumen_{fecha}"] = resumen
+                for e in errores:
+                    st.error(e)
+                if not errores:
+                    st.rerun()
+    
         if st.session_state.get(f"rep_resumen_{fecha}"):
             with st.expander("Resultado de la última carga", expanded=True):
                 for linea in st.session_state[f"rep_resumen_{fecha}"]:
@@ -9756,6 +14145,7 @@ def _modulo_vdiario():
                           "personas": len(trab), "hh": sum(t.get("total", 0) for t in trab),
                           "fuera_plantel": sum(1 for t in trab if t["rut"] not in plantel),
                           "actividades": len(d.get("actividades", [])) + len(d.get("uso_recurso", [])),
+                          "materiales": len(d.get("materiales", [])),
                           "avisos": " · ".join(d.get("avisos", []))})
         df = pd.DataFrame(filas)
         df.insert(0, "quitar", False)
@@ -9768,7 +14158,7 @@ def _modulo_vdiario():
                            "turno": st.column_config.SelectboxColumn("Turno", options=["Día", "Noche"], required=True),
                            "supervisor": "Supervisor", "fecha_reporte": "Fecha del reporte", "personas": "Personas",
                            "hh": st.column_config.NumberColumn("HH", format="%.0f"), "fuera_plantel": "No están en BD Personal",
-                           "actividades": "Actividades", "avisos": st.column_config.TextColumn("Avisos", width="large")})
+                           "actividades": "Actividades", "materiales": "Materiales", "avisos": st.column_config.TextColumn("Avisos", width="large")})
         k = st.columns(3)
         k[0].metric("Reportes", len(df))
         k[1].metric("Personas", int(df["personas"].sum()))
@@ -9830,6 +14220,8 @@ def _modulo_vdiario():
         plantel = {p.rut for p in pl.personas}
         cuenta: dict[str, int] = {}
         for m in marcas.values():
+            if not m["estado"]:
+                continue                                      # solo ficha (sin marca del día)
             e = m["estado"] if m["estado"] != "P" else ("TN" if m.get("noche") else "Asistió")
             cuenta[e] = cuenta.get(e, 0) + 1
         numeros = {r.split("-")[0] for r in plantel}
@@ -9839,6 +14231,16 @@ def _modulo_vdiario():
                    + (f" · {fuera} RUT no están en BD Personal" if fuera else ""))
         for n in actual.get("notas", []):
             st.caption(n)
+        vig = [m for m in marcas.values() if m.get("ficha") and D._vigente(D.Marca(**m))]
+        if vig:
+            dir_t = sum(1 for m in vig if D.norm(m["ficha"].get("W")) == "DIRECTO")
+            ind_t = len(vig) - dir_t
+            dir_b = sum(1 for p in pl.personas if D.norm(p.moimod) == "DIRECTO")
+            nuevos = sum(1 for r, m in marcas.items() if m in vig and r not in plantel and r.split("-")[0] not in numeros)
+            fin = sum(1 for r, m in marcas.items() if r in plantel and m.get("ficha") and D._finiquitado(D.Marca(**m)))
+            st.info(f"Contratados vigentes según la tarja: **{dir_t} directos** y **{ind_t} indirectos**. BD Personal del informe "
+                    f"anterior tiene {dir_b} directos. Al generar: se agregan **{nuevos}** contratado(s) nuevo(s) con sus datos de la "
+                    f"tarja y salen **{fin}** finiquitado(s).")
         with st.expander("Ver tarja leída"):
             st.dataframe(pd.DataFrame([{"RUT": r, "Nombre": m["nombre"], "Estado": m["estado"],
                                         "Turno": {True: "Noche", False: "Día"}.get(m.get("noche"), "–"), "En la tarja": m["texto"],
@@ -9911,6 +14313,8 @@ def _modulo_vdiario():
             return
     
         clave = f"diario_{fecha}_{base['id']}"
+        _restaurar_borrador(clave)
+        _barra_borrador(clave)
         ajustes = st.session_state.setdefault(f"{clave}_ajustes", {})
         encabezados = db.config(c.contrato_id(), "encabezados", {})
         tj = tarja_del_dia(fecha)
@@ -10023,7 +14427,7 @@ def _modulo_vdiario():
                                                                         "otro día para esta actividad · Sugerido: coincidencia clara con el P6")
                     cfg["criterio"] = st.column_config.SelectboxColumn("Criterio", options=pl.criterios or [D.CRITERIO_DEFECTO],
                                                                        width="medium", required=True)
-                ed_a = st.data_editor(dfa[columnas], hide_index=True, use_container_width=True, key=f"{clave}_ed_act", height=320,
+                ed_a = _editor(clave, "act", dfa[columnas], "clave", hide_index=True, use_container_width=True, height=320,
                                       disabled=["especialidad", "turno", "hh", "clave", "subsistema", "origen_id"], column_config=cfg)
                 acts = ed_a.to_dict("records")
                 if master:
@@ -10042,7 +14446,10 @@ def _modulo_vdiario():
                 acts = []
             nota = st.text_area("Nota (opcional)", key=f"{clave}_nota", height=70)
             texto = D.texto_actividades(acts, nota)
-            texto_final = st.text_area("Texto que irá en el informe (puedes editarlo)", texto, height=260, key=f"{clave}_texto_{hash(texto)}")
+            previo = st.session_state.get(f"{clave}__texto") or {}
+            inicial = previo.get("final") if previo.get("base") == texto and previo.get("final") is not None else texto
+            texto_final = st.text_area("Texto que irá en el informe (puedes editarlo)", inicial, height=260, key=f"{clave}_texto_{hash(texto)}")
+            st.session_state[f"{clave}__texto_actual"] = {"base": texto, "final": texto_final}
     
     
         with t10:
@@ -10082,8 +14489,8 @@ def _modulo_vdiario():
                                                       if not a.startswith("_")}}).get(k, "")
                                          for k in ("patente", "tipo", "modelo", "disponible", "estado", "observacion", "turno", "operador")}
                                         for d in pl.maquinaria])
-                    ed_m = st.data_editor(
-                        dfm, hide_index=True, use_container_width=True, key=f"{clave}_ed_maq", height=320, disabled=["patente", "tipo", "modelo"],
+                    ed_m = _editor(
+                        clave, "maq", dfm, "patente", hide_index=True, use_container_width=True, height=320, disabled=["patente", "tipo", "modelo"],
                         column_config={"patente": "Patente", "tipo": "Equipo", "modelo": "Modelo / marca",
                                        "disponible": st.column_config.SelectboxColumn("Disponible", options=["SI", "NO"]),
                                        "estado": st.column_config.SelectboxColumn(
@@ -10139,7 +14546,7 @@ def _modulo_vdiario():
                                      "noche": e.noche, "observacion": e.observacion} for e in pl.equipos])
                 if pl.maquinaria:
                     st.caption("Los equipos con patente toman el Turno día de «Maquinaria del día» (BD Maquinaria); cámbialos allá.")
-                ed_e = st.data_editor(dfe, hide_index=True, use_container_width=True, key=f"{clave}_ed_eq", height=320,
+                ed_e = _editor(clave, "eq", dfe, "fila", hide_index=True, use_container_width=True, height=320,
                                       disabled=["grupo", "equipo", "patente"],
                                       column_config={"fila": None, "grupo": "Grupo", "equipo": "Equipo", "patente": "Patente",
                                                      "dia": st.column_config.NumberColumn("Turno día", min_value=0, step=1),
@@ -10159,7 +14566,7 @@ def _modulo_vdiario():
                                "(actividades con criterio Interferencia o Detención). Revisa horas de inicio y término.")
                 rot = pl.cab_interferencia or {}
                 r_ = lambda col, defecto: (rot.get(col) or defecto).replace("\n", " ")
-                ed_i = st.data_editor(dfi, num_rows="dynamic", use_container_width=True, key=f"{clave}_ed_int",
+                ed_i = _editor(clave, "int", dfi, None, num_rows="dynamic", use_container_width=True,
                                       column_config={"detalle": r_("B", "Detalle"), "area": r_("L", "Área"), "equipo": r_("O", "Equipo"),
                                                      "inicio": r_("R", "Inicio"), "termino": r_("U", "Término"), "horas": r_("X", "Horas"),
                                                      "tipo": st.column_config.SelectboxColumn(r_("AG", "Tipo"), options=pl.listas.get("interferencia") or None),
@@ -10171,7 +14578,7 @@ def _modulo_vdiario():
     
     
         with t60:
-            with st.expander(f"Uso de recurso / NDC (hasta {len(pl.filas_udr)})"):
+            with st.expander(f"Uso de recurso / NDC (la planilla trae {len(pl.filas_udr)} filas y se amplía si hay más)", expanded=True):
                 sug = list(cons.uso_recurso)
                 # actividades que tú marcaste con criterio «Extraordinaria / Adicional» también van a UDR
                 por_clave = {(a["archivo"], a["codigo"]): a for a in cons.actividades}
@@ -10207,7 +14614,7 @@ def _modulo_vdiario():
                                + (f". La numeración sigue el correlativo del informe anterior (último N° {pl.ultimo_ndc})." if pl.ultimo_ndc
                                   else ". No se encontró el último N° NDC del informe anterior: completa la numeración.")
                                + " Revisa, completa o agrega las demás.")
-                ed_u = st.data_editor(dfu, num_rows="dynamic", use_container_width=True, key=f"{clave}_ed_udr",
+                ed_u = _editor(clave, "udr", dfu, None, num_rows="dynamic", use_container_width=True,
                                       column_config={"ndc": st.column_config.NumberColumn("N° NDC", step=1),
                                                      "descripcion": st.column_config.TextColumn("Título / obra", width="medium"),
                                                      "detalle": st.column_config.TextColumn("Descripción del trabajo", width="large"),
@@ -10278,6 +14685,7 @@ def _modulo_vdiario():
         with tgen:
             _revision(pl, cons, ent, acts, tj, tarja_maquinaria_del_dia(fecha))
             if st.button("Generar informe", type="primary", key=f"{clave}_gen"):
+                _guardar_borrador(clave)
                 with st.spinner("Generando el informe sobre la planilla oficial…"):
                     st.session_state[f"{clave}_xlsx"] = D.generar_informe(pl, cons, ent)
                 # recordar los sistemas elegidos para las actividades
@@ -10315,8 +14723,7 @@ def _modulo_vdiario():
                         "indirectos_noche": t["MOI"]["U"], "hh_mod": cons.hh_constr + cons.hh_precom, "hh_moi": t["MOI"]["X"],
                         "reportes": len(reps), "firmas": [f"{f['rol']}: {f['nombre']}" + (" (firmado)" if f.get("firma") else "")
                                                           for f in ent.firmas]}, aid, c.nombre_usuario(), contrato_id=c.contrato_id())
-                    for k_ in [k_ for k_ in st.session_state if str(k_).startswith(clave)]:
-                        del st.session_state[k_]
+                    _borrar_borrador(clave)
                     st.cache_data.clear()
                     st.success(f"Informe N° {int(numero)} emitido. Ya es la base para el {c.fecha(fecha + dt.timedelta(days=1))}.")
                     st.rerun()
@@ -10377,20 +14784,21 @@ def _modulo_vdiario():
             st.info("La planilla base no tiene la sección de materiales y consumibles.")
             return []
         cap = len(pl.materiales["filas"])
-        st.caption(f"Hasta {cap} filas. Se proponen los materiales declarados en los formularios UDR del día.")
+        st.caption(f"La planilla trae {cap} filas y se amplía si hay más. Se proponen los materiales de los PM de materiales "
+                   "(PDF) y de los formularios UDR del día.")
         cols = ["descripcion", "unidad", "cantidad", "trabajo", "solicitado", "observacion"]
         dfm = pd.DataFrame([{k: m.get(k) for k in cols} for m in cons.materiales], columns=cols)
         for k in ("descripcion", "unidad", "trabajo", "solicitado", "observacion"):
             dfm[k] = dfm[k].astype(object).where(dfm[k].notna(), "")
         dfm["cantidad"] = pd.to_numeric(dfm["cantidad"], errors="coerce")
-        ed = st.data_editor(dfm, num_rows="dynamic", use_container_width=True, key=f"{clave}_ed_mat",
+        ed = _editor(clave, "mat", dfm, None, num_rows="dynamic", use_container_width=True,
                             column_config={"descripcion": st.column_config.TextColumn("Descripción material / consumible", width="large"),
                                            "unidad": "Unidad", "cantidad": st.column_config.NumberColumn("Cantidad"),
                                            "trabajo": st.column_config.TextColumn("Activity ID o trabajo"),
                                            "solicitado": "Solicitado por / Aprobado por", "observacion": "Observación"})
         out = _filas_limpias(ed.to_dict("records"))
         if len(out) > cap:
-            st.warning(f"La planilla tiene espacio para {cap} materiales; se escribirán los primeros.")
+            st.info(f"{len(out)} materiales: se agregan {len(out) - cap} fila(s) a la sección 8.0 al generar.")
         return out
     
     
@@ -10423,11 +14831,16 @@ def _modulo_vdiario():
         fila("4.0 Equipos", None, f"{len(pl.equipos)} filas · {len(pl.maquinaria)} equipos con patente", "BD Maquinaria / tarja de maquinaria")
         fila("5.0 Interferencias", len(ent.interferencias) <= len(pl.filas_interferencia),
              f"{len(ent.interferencias)} de {len(pl.filas_interferencia)} filas", "Reportes (criterio Interferencia / Detención)")
-        fila("6.0 UDR", len(ent.uso_recurso) <= len(pl.filas_udr), f"{len(ent.uso_recurso)} de {len(pl.filas_udr)} filas · N° desde "
-             f"{(pl.ultimo_ndc or 0) + 1}", "Formularios UDR, adicionales y actividades marcadas")
+        extra_u = max(0, len(ent.uso_recurso) - len(pl.filas_udr))
+        fila("6.0 UDR", bool(pl.filas_udr) or not ent.uso_recurso,
+             f"{len(ent.uso_recurso)} UDR · N° {(pl.ultimo_ndc or 0) + 1} a {(pl.ultimo_ndc or 0) + len(ent.uso_recurso)}"
+             + (f" · se agregan {extra_u} fila(s) a la sección (la planilla trae {len(pl.filas_udr)})" if extra_u else ""),
+             "Formularios UDR, adicionales y actividades marcadas")
         if pl.materiales:
-            fila("8.0 Materiales", len(ent.materiales) <= len(pl.materiales["filas"]),
-                 f"{len(ent.materiales)} de {len(pl.materiales['filas'])} filas", "Formularios UDR (materiales)")
+            extra_m = max(0, len(ent.materiales) - len(pl.materiales["filas"]))
+            fila("8.0 Materiales", True, f"{len(ent.materiales)} material(es)"
+                 + (f" · se agregan {extra_m} fila(s) a la sección (la planilla trae {len(pl.materiales['filas'])})" if extra_m else ""),
+                 "PM de materiales (PDF) + formularios UDR")
         elab = next((f for f in ent.firmas if f.get("rol") == "Elaborado por"), None)
         fila("8.0 Validación", bool(elab and elab.get("firma")), "Firmado por " + elab["nombre"] if elab and elab.get("firma")
              else "Sin firma de quien elabora", "Mi cuenta → Firma para informes")
@@ -11494,6 +15907,11 @@ admin = _modulo_admin()
 # ======================================================================
 CAL = calendario
 
+try:   # los borradores del informe diario reponen valores de widgets: sin aviso amarillo de Streamlit por eso
+    from streamlit import config as _st_config
+    _st_config.set_option("global.disableWidgetStateDuplicationWarning", True)
+except Exception:
+    pass
 
 # Estilos de la marca con modo día / noche (estáticos: no incluyen datos de usuarios ni de archivos).
 tema.aplicar()
@@ -11517,64 +15935,75 @@ def _marca(ancho_max=None):
 
 
 def pantalla_acceso():
-    _, col, _ = st.columns([1, 1.2, 1])
+    izq, col = st.columns([1.15, 1], gap="small")
+    with izq:
+        st.markdown(tema.panel_login(tema.logo_blanco(LOGO)), unsafe_allow_html=True)
     with col:
-        _marca()
-        if not auth.hay_usuarios():
-            st.subheader("Configuración inicial")
-            st.caption("No existe ningún usuario. Crea la cuenta de administrador.")
-            with st.form("setup"):
-                u = st.text_input("Usuario administrador")
-                p = st.text_input("Contraseña", type="password")
-                p2 = st.text_input("Confirmar contraseña", type="password")
-                if st.form_submit_button("Crear administrador", type="primary"):
-                    if p != p2:
-                        st.error("Las contraseñas no coinciden.")
-                    else:
-                        try:
-                            if auth.hay_usuarios():  # otra sesión se adelantó
-                                st.error("El administrador ya fue creado. Recarga la página.")
-                            else:
-                                auth.crear_usuario(u, p, rol="admin", estado="Aprobado")
-                                st.success("Administrador creado. Ya puedes ingresar.")
-                                st.rerun()
-                        except ValueError as e:
-                            st.error(str(e))
-            return
+        st.markdown(f"<div class='sy-login-der'></div><span class='sy-version'><i></i>SYNCORE · Versión {tema.VERSION}</span>"
+                    "<div class='sy-bienv'>Bienvenido</div><div class='sy-bienv-sub'>Ingresa con tu usuario para continuar.</div>",
+                    unsafe_allow_html=True)
+        _formularios_acceso()
+        st.markdown(f"<div class='sy-login-pie'><span>© 2026 Syncore Montajes Industriales</span>"
+                    f"<span>v{tema.VERSION} · {tema.FECHA_VERSION}</span></div>", unsafe_allow_html=True)
 
-        t_login, t_reg = st.tabs(["Iniciar sesión", "Solicitar acceso"])
-        with t_login:
-            with st.form("login"):
-                u = st.text_input("Usuario")
-                p = st.text_input("Contraseña", type="password")
-                recordar = st.checkbox(f"Mantener la sesión iniciada en este equipo ({auth.DIAS_RECORDAR:g} días)",
-                                       help="Úsalo solo en equipos personales.")
-                if st.form_submit_button("Ingresar", type="primary", use_container_width=True):
-                    usuario, err = auth.autenticar(u, p)
-                    if usuario:
-                        token = auth.crear_sesion(usuario["id"], _navegador(), recordar)
-                        st.session_state["usuario"] = usuario
-                        st.session_state["token_sesion"] = token
-                        st.query_params["s"] = token
-                        st.rerun()
-                    else:
-                        st.error(err)
-        with t_reg:
-            with st.form("registro", clear_on_submit=False):
-                u = st.text_input("Usuario")
-                n = st.text_input("Nombre completo")
-                p = st.text_input("Contraseña", type="password",
-                                  help=f"Mínimo {auth.LARGO_MINIMO} caracteres, con letras y números.")
-                p2 = st.text_input("Confirmar contraseña", type="password")
-                if st.form_submit_button("Enviar solicitud"):
-                    if p != p2:
-                        st.error("Las contraseñas no coinciden.")
-                    else:
-                        try:
-                            auth.crear_usuario(u, p, n)
-                            st.success("Solicitud enviada. Un administrador debe aprobar tu cuenta.")
-                        except ValueError as e:
-                            st.error(str(e))
+
+def _formularios_acceso():
+    """Alta del primer administrador, inicio de sesión y solicitud de acceso."""
+    if not auth.hay_usuarios():
+        st.subheader("Configuración inicial")
+        st.caption("No existe ningún usuario. Crea la cuenta de administrador.")
+        with st.form("setup"):
+            u = st.text_input("Usuario administrador")
+            p = st.text_input("Contraseña", type="password")
+            p2 = st.text_input("Confirmar contraseña", type="password")
+            if st.form_submit_button("Crear administrador", type="primary"):
+                if p != p2:
+                    st.error("Las contraseñas no coinciden.")
+                else:
+                    try:
+                        if auth.hay_usuarios():  # otra sesión se adelantó
+                            st.error("El administrador ya fue creado. Recarga la página.")
+                        else:
+                            auth.crear_usuario(u, p, rol="admin", estado="Aprobado")
+                            st.success("Administrador creado. Ya puedes ingresar.")
+                            st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+        return
+
+    t_login, t_reg = st.tabs(["Iniciar sesión", "Solicitar acceso"])
+    with t_login:
+        with st.form("login"):
+            u = st.text_input("Usuario")
+            p = st.text_input("Contraseña", type="password")
+            recordar = st.checkbox(f"Mantener la sesión iniciada en este equipo ({auth.DIAS_RECORDAR:g} días)",
+                                   help="Úsalo solo en equipos personales.")
+            if st.form_submit_button("Ingresar", type="primary", use_container_width=True):
+                usuario, err = auth.autenticar(u, p)
+                if usuario:
+                    token = auth.crear_sesion(usuario["id"], _navegador(), recordar)
+                    st.session_state["usuario"] = usuario
+                    st.session_state["token_sesion"] = token
+                    st.query_params["s"] = token
+                    st.rerun()
+                else:
+                    st.error(err)
+    with t_reg:
+        with st.form("registro", clear_on_submit=False):
+            u = st.text_input("Usuario")
+            n = st.text_input("Nombre completo")
+            p = st.text_input("Contraseña", type="password",
+                              help=f"Mínimo {auth.LARGO_MINIMO} caracteres, con letras y números.")
+            p2 = st.text_input("Confirmar contraseña", type="password")
+            if st.form_submit_button("Enviar solicitud"):
+                if p != p2:
+                    st.error("Las contraseñas no coinciden.")
+                else:
+                    try:
+                        auth.crear_usuario(u, p, n)
+                        st.success("Solicitud enviada. Un administrador debe aprobar tu cuenta.")
+                    except ValueError as e:
+                        st.error(str(e))
 
 
 def _navegador() -> str:
@@ -11625,7 +16054,7 @@ def _selector_contrato(usuario) -> dict | None:
     fila = {int(r.id): r for r in cts.itertuples()}
     if len(ids) == 1:
         elegido = ids[0]
-        st.markdown(f"**Contrato:** {fila[elegido].codigo}")
+        st.markdown(f"**{fila[elegido].codigo}**")
     else:
         elegido = int(st.selectbox("Contrato", ids, index=ids.index(actual) if actual in ids else 0, key="_contrato_sel",
                                    format_func=lambda i: fila[i].codigo, help="Todo lo que ves y cargas queda en este contrato."))
@@ -11663,7 +16092,8 @@ def main():
 
     with st.sidebar:
         _marca()
-        st.caption(f"👤 {usuario['nombre']} · {auth.ROLES.get(usuario['rol'], usuario['rol'])}")
+        st.markdown(tema.tarjeta_usuario(usuario["nombre"], auth.ROLES.get(usuario["rol"], usuario["rol"])), unsafe_allow_html=True)
+        st.markdown("<div class='sy-etq'>CONTRATO</div>", unsafe_allow_html=True)
         contrato = _selector_contrato(usuario)
         if contrato:
             st.caption(contrato["nombre"])
@@ -11684,7 +16114,7 @@ def main():
             st.info("Crea el primer contrato para empezar a cargar información.")
         else:
             st.warning("Tu cuenta aún no tiene contratos asignados. Pide a un administrador que te dé acceso.")
-        st.navigation({"Cuenta": cuenta}).run()
+        st.navigation({"Cuenta": cuenta}, expanded=True).run()
         return
 
     paginas = {
@@ -11692,6 +16122,7 @@ def main():
             st.Page(dashboard.vista, title="Dashboard", icon="📊", url_path="dashboard", default=True),
             st.Page(subsistemas.vista, title="Avance por subsistema", icon="🏗️", url_path="subsistemas"),
             st.Page(informe.vista, title="Informe semanal", icon="📈", url_path="informe-semanal"),
+            st.Page(vcubicacion.vista, title="Cubicación por disciplina", icon="📐", url_path="cubicacion"),
             st.Page(wla.vista, title="Lookahead 6WLA", icon="📋", url_path="6wla"),
         ],
         "Terreno": [
@@ -11709,7 +16140,7 @@ def main():
         paginas["Cuenta"].append(st.Page(admin.contratos, title="Contratos", icon="🏢", url_path="contratos"))
         paginas["Cuenta"].append(st.Page(admin.usuarios, title="Usuarios", icon="🛡️", url_path="usuarios"))
         paginas["Cuenta"].append(st.Page(admin.respaldo, title="Respaldo de datos", icon="💾", url_path="respaldo"))
-    st.navigation(paginas).run()
+    st.navigation(paginas, expanded=True).run()
 
 
 main()
